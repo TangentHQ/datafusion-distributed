@@ -320,6 +320,7 @@ mod tests {
         let mut forwarders = tokio::task::JoinSet::new();
         let mut consumers = tokio::task::JoinSet::new();
         let mut senders = vec![];
+        let mut workers = vec![];
         for rank in 0..2 {
             let gate = Arc::clone(&gate);
             let worker = Worker::from_session_builder(move |mut query: WorkerQueryContext| {
@@ -339,6 +340,7 @@ mod tests {
                 }
             })
             .with_max_message_size(1024);
+            workers.push(worker.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let url: url::Url = format!("http://{}", listener.local_addr()?)
                 .parse()
@@ -442,8 +444,10 @@ mod tests {
         );
         gate.release.add_permits(1);
         let mut ids = vec![];
+        let mut retained = None;
         while let Some(result) = consumers.join_next().await {
             for batch in result.unwrap()? {
+                retained = Some(batch.column(0).slice(0,1));
                 let values = batch
                     .column(0)
                     .as_any()
@@ -464,10 +468,16 @@ mod tests {
             ids.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             (1..=8).map(|id| format!("frozen:{id}")).collect::<Vec<_>>()
         );
-        drop(senders);
-        drop(feeds);
-        forwarders.abort_all();
-        servers.abort_all();
+        for worker in &workers { worker.shutdown().await; }
+        drop(senders); drop(feeds); drop(feed);
+        forwarders.abort_all(); while forwarders.join_next().await.is_some() {}
+        servers.abort_all(); while servers.join_next().await.is_some() {}
+        drop(workers);
+        let pool = Arc::clone(ctx.memory_pool());
+        drop(ctx);
+        assert!(pool.reserved()>0,"projected child lost its byte owner");
+        drop(retained);
+        assert_eq!(pool.reserved(),0,"shutdown retained query buffers");
         Ok(())
     }
 }

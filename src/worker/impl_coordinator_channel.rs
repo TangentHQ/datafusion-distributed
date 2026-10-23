@@ -75,6 +75,14 @@ impl Worker {
             .get_with(key, async { Default::default() })
             .await;
 
+        let has_demand = request
+            .work_unit_feed_declarations
+            .iter()
+            .any(|decl| decl.demand);
+        let demand_done = tokio_util::sync::CancellationToken::new();
+        if !has_demand {
+            demand_done.cancel();
+        }
         let mut remote_work_unit_feed_registry = RemoteWorkUnitFeedRegistry::default();
         for decl in request.work_unit_feed_declarations {
             remote_work_unit_feed_registry.add(
@@ -94,10 +102,10 @@ impl Worker {
         if let MaybeEncoded::Encoded(bytes) = &request.plan {
             memory.retain(bytes.capacity())?;
         }
+        let requester = has_demand.then(|| Arc::new(Requester(demand_tx)));
         let task_data = || async {
             let mut cfg = SessionConfig::default()
                 .with_extension(Arc::clone(&memory))
-                .with_extension(Arc::new(Requester(demand_tx)))
                 .with_extension(Arc::new(remote_work_unit_feed_registry.receivers))
                 .with_extension(Arc::new(DistributedTaskContext {
                     task_index: request.task_key.task_number,
@@ -109,6 +117,9 @@ impl Worker {
                 }))
                 .with_distributed_option_extension_from_headers::<DistributedConfig>(&headers)?;
 
+            if let Some(requester) = requester {
+                cfg = cfg.with_extension(requester);
+            }
             let d_cfg = DistributedConfig::from_config_options(cfg.options())?;
             let shuffle_batch_size = d_cfg.shuffle_batch_size;
             let collect_metrics = d_cfg.collect_metrics;
@@ -201,6 +212,7 @@ impl Worker {
         // 5. The metrics and final dynamic filters are sent back in the worker->coordinator
         //    channel, and then that channel is closed.
         let closed = self.closed.clone();
+        let demand_complete = demand_done.clone();
         self.readers.spawn(async move {
             let mut stream = stream.map_ok(set_work_unit_received_time);
             while let Some(Ok(msg)) = tokio::select! {
@@ -285,6 +297,9 @@ impl Worker {
                                 }
                                 None => {
                                     senders.remove(&(demand.id, demand.partition));
+                                    if !senders.values().any(|tx| tx.credit.is_some()) {
+                                        demand_complete.cancel();
+                                    }
                                 }
                             }
                             Ok::<_, DataFusionError>(())
@@ -324,6 +339,7 @@ impl Worker {
                 }
             }
 
+            demand_complete.cancel();
             // A truncated channel is not a successful feed EOF. Only an explicit
             // sequenced response may finish a demand partition.
             if let Some(senders) = work_unit_senders {
@@ -420,11 +436,12 @@ impl Worker {
             }));
 
         let dynamic_filters_error_stream = ReceiverStream::new(dynamic_filters_error_rx);
+        let demand_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(demand_rx)
+            .map(Ok)
+            .take_until(demand_done.cancelled_owned());
 
         let stream = select_all([
-            tokio_stream::wrappers::UnboundedReceiverStream::new(demand_rx)
-                .map(Ok)
-                .boxed(),
+            demand_stream.boxed(),
             produced_dynamic_filters_stream.map(Ok).boxed(),
             load_info_stream.map(Ok).boxed(),
             metrics_stream.map(Ok).boxed(),
