@@ -27,6 +27,7 @@ message CoordinatorToWorkerMsg {
     KickOffSampling kick_off_sampling = 4;
     // Sends a coordinator-merged dynamic-filter update to one consumer task.
     ApplyDynamicFilter apply_dynamic_filter = 5;
+    WorkUnitResponse work_unit_response = 6;
   }
 }
 
@@ -72,7 +73,18 @@ message WorkerToCoordinatorMsg {
 
     // An observed dynamic filter state produced by this task.
     ProducedDynamicFilter produced_dynamic_filter = 5;
+    WorkUnitDemand work_unit_demand = 6;
   }
+}
+
+message WorkUnitDemand {
+  bytes id = 1;
+  uint64 partition = 2;
+  uint64 sequence = 3;
+}
+message WorkUnitResponse {
+  WorkUnitDemand demand = 1;
+  WorkUnit unit = 2;
 }
 
 message DynamicFilter {
@@ -143,6 +155,7 @@ message SetPlanRequest {
     bytes id = 1;
     // The amount of partitions expected to be streamed.
     uint64 partitions = 2;
+    bool demand = 3;
   }
   // Information about all the work unit feeds that will be streamed from coordinator to worker.
   // This information is needed here because at the moment of setting the plan, all the appropriate

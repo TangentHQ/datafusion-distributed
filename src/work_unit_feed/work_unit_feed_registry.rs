@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub(crate) trait ErasedWorkUnitFeed: Send + Sync {
     /// Unique identifier of the feed (same UUID as the concrete `WorkUnitFeed`).
     fn id(&self) -> Uuid;
+    fn demand(&self) -> bool;
 
     /// Produces a stream of boxed [`WorkUnit`]s for the given partition.
     ///
@@ -37,6 +38,10 @@ where
 {
     fn id(&self) -> Uuid {
         self.id
+    }
+
+    fn demand(&self) -> bool {
+        self.demand
     }
 
     fn feed(

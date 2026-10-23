@@ -125,6 +125,7 @@ use uuid::Uuid;
 pub struct WorkUnitFeed<T: WorkUnitFeedProvider> {
     pub(crate) id: Uuid,
     pub(crate) provider: RemoteOrLocalProvider<T>,
+    pub(crate) demand: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +158,8 @@ impl<T: WorkUnitFeedProvider> RemoteOrLocalProvider<T> {
 pub struct WorkUnitFeedProto {
     #[prost(bytes, tag = "1")]
     pub id: Vec<u8>,
+    #[prost(bool, tag = "2")]
+    pub demand: bool,
 }
 
 impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
@@ -167,8 +170,19 @@ impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
     pub fn new(provider: T) -> Self {
         Self {
             id: Uuid::new_v4(),
+            demand: false,
             provider: RemoteOrLocalProvider::Local(provider),
         }
+    }
+
+    /// Request the next descriptor only when the leaf polls its feed again.
+    /// A leaf must fully consume a descriptor before polling the next one.
+    /// Providers may share one frozen queue among partitions to assign remaining
+    /// work to idle workers. Errors or lost replies fail the query; no redelivery
+    /// or independent retry authority is introduced.
+    pub fn with_demand(mut self) -> Self {
+        self.demand = true;
+        self
     }
 
     /// Reconstructs a [`WorkUnitFeed`] from its serialized form. The resulting feed is in
@@ -179,6 +193,7 @@ impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
         let id = deserialize_uuid(&proto.id)?;
         Ok(WorkUnitFeed {
             id,
+            demand: proto.demand,
             provider: RemoteOrLocalProvider::Remote(RemoteFeedProvider {
                 id,
                 metrics: ExecutionPlanMetricsSet::new(),
@@ -193,6 +208,7 @@ impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
     pub fn to_proto(&self) -> WorkUnitFeedProto {
         WorkUnitFeedProto {
             id: serialize_uuid(&self.id),
+            demand: self.demand,
         }
     }
 

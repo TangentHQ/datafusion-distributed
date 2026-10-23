@@ -20,6 +20,20 @@ impl Worker {
         &self,
         request: ExecuteTaskRequest,
     ) -> Result<(Vec<SendableRecordBatchStream>, Arc<TaskContext>)> {
+        let _admission = self.admission.read().await;
+        if self.closed.is_cancelled() {
+            return exec_err!("Worker is shut down");
+        }
+        tokio::select! {
+            result = self.open_task(request) => result,
+            _ = self.closed.cancelled() => exec_err!("Worker is shut down"),
+        }
+    }
+
+    async fn open_task(
+        &self,
+        request: ExecuteTaskRequest,
+    ) -> Result<(Vec<SendableRecordBatchStream>, Arc<TaskContext>)> {
         let entry = self
             .task_data_entries
             .get_with(request.task_key, async { Default::default() })

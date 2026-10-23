@@ -16,7 +16,7 @@ use crate::events::{
 use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::stage::LocalStage;
-use crate::work_unit_feed::WorkUnitFeedRegistry;
+use crate::work_unit_feed::{Demands, WorkUnitFeedRegistry};
 use crate::work_unit_feed::{build_work_unit_batch_msg, set_work_unit_send_time};
 use crate::{
     CoordinatorToWorkerMsg, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedGetterExt,
@@ -62,6 +62,7 @@ pub(super) struct QueryCoordinator {
     completed_dynamic_filter_store: Option<Arc<Store<TaskCompletedDynamicFilters>>>,
     dynamic_filter_registry: Arc<DynamicFilterRegistry>,
     pub(super) spawner: Spawner,
+    demands: Arc<Demands>,
 }
 
 impl QueryCoordinator {
@@ -76,6 +77,7 @@ impl QueryCoordinator {
         let spawner = Spawner::new(output);
         Self {
             task_ctx,
+            demands: Arc::default(),
             metrics: metrics_set.clone(),
             metrics_store,
             completed_dynamic_filter_store,
@@ -92,6 +94,7 @@ impl QueryCoordinator {
     /// stage.
     pub(super) fn stage_coordinator<'a>(&'a self, stage: &'a LocalStage) -> StageCoordinator<'a> {
         StageCoordinator {
+            demands: &self.demands,
             plan: &stage.plan,
             query_id: stage.query_id,
             stage_id: stage.num,
@@ -121,6 +124,7 @@ impl QueryCoordinator {
 /// - Building tasks that stream partition feeds from local [WorkUnitFeedExec] nodes to their
 ///   remote counterparts.
 pub(super) struct StageCoordinator<'a> {
+    demands: &'a Arc<Demands>,
     plan: &'a Arc<dyn ExecutionPlan>,
     query_id: Uuid,
     stage_id: usize,
@@ -264,6 +268,8 @@ impl<'a> StageCoordinator<'a> {
         else {
             return internal_err!("Missing coordinator_to_worker_tx");
         };
+        self.demands
+            .sender(task_key, coordinator_to_worker_tx.clone())?;
         self.dynamic_filter_registry
             .register_sender(task_key, coordinator_to_worker_tx.clone())?;
 
@@ -293,6 +299,8 @@ impl<'a> StageCoordinator<'a> {
         let mut completed_dynamic_filter_store = self.completed_dynamic_filter_store.clone();
         let dynamic_filter_registry = Arc::clone(self.dynamic_filter_registry);
         let task_ctx = Arc::clone(self.task_ctx);
+        let demands = Arc::clone(self.demands);
+        let spawner = self.spawner.clone();
         let (load_info_tx, load_info_rx) = unbounded_channel();
         let (reports_tx, mut reports_rx) = unbounded_channel::<FinalReport>();
         let (runtime_tx, mut runtime_rx) = unbounded_channel::<RuntimeUpdate>();
@@ -302,6 +310,14 @@ impl<'a> StageCoordinator<'a> {
         self.spawner.spawn(async move {
             while let Some(msg) = worker_to_coordinator_stream.try_next().await? {
                 let receiver_closed = match msg {
+                    WorkerToCoordinatorMsg::WorkUnitDemand(demand) => {
+                        let request = demands.request(task_key, demand)?;
+                        let cancel = spawner.query_finished();
+                        spawner.spawn(async move {
+                            select! { result = request => result, _ = cancel.cancelled() => Ok(()) }
+                        });
+                        false
+                    }
                     WorkerToCoordinatorMsg::TaskMetrics(metrics) => {
                         reports_tx.send(FinalReport::Metrics(metrics)).is_err()
                     }
@@ -397,6 +413,9 @@ impl<'a> StageCoordinator<'a> {
                 return Ok(TreeNodeRecursion::Continue);
             };
 
+            if wuf.demand() {
+                return Ok(TreeNodeRecursion::Continue);
+            }
             let partitions = plan.properties().partitioning.partition_count();
             let start_partition = partitions * d_ctx.task_index;
             let end_partition = start_partition + partitions;
@@ -476,7 +495,32 @@ impl<'a> StageCoordinator<'a> {
                 work_unit_feed_declarations.push(WorkUnitFeedDeclaration {
                     id: wuf.id(),
                     partitions: plan.properties().partitioning.partition_count(),
+                    demand: wuf.demand(),
                 });
+
+                if wuf.demand() {
+                    let partitions = plan.properties().partitioning.partition_count();
+                    let ctx = Arc::new(task_ctx_with_extension(
+                        self.task_ctx,
+                        DistributedWorkUnitFeedContext {
+                            fan_out_tasks: d_ctx.task_count,
+                        },
+                    ));
+                    let task = TaskKey {
+                        query_id: self.query_id,
+                        stage_id: self.stage_id,
+                        task_number: task_i,
+                    };
+                    for partition in 0..partitions {
+                        self.demands.add(
+                            task,
+                            wuf.id(),
+                            partition,
+                            wuf.feed(partitions * d_ctx.task_index + partition, Arc::clone(&ctx))?,
+                            ctx.memory_pool(),
+                        )?;
+                    }
+                }
 
                 // WorkUnitFeeds are transitioned to remote mode during proto conversion.
                 // Right now, there's no other way for a WorkUnitFeed to be transitioned to

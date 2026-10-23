@@ -1,3 +1,5 @@
+mod demand;
+pub(crate) use demand::{Credit, Demands, Requester};
 mod remote_work_unit_feed;
 mod work_unit;
 #[allow(clippy::module_inception)]

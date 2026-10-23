@@ -8,7 +8,7 @@ use crate::dynamic_filtering::{
 use crate::events::{WorkerPlanRewriteEvent, WorkerPlanRewriteHandlers};
 use crate::execution_plans::SamplerExec;
 use crate::protocol::LocalWorkerContext;
-use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
+use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, Requester, set_work_unit_received_time};
 use crate::worker::task_data::TaskDataMetrics;
 use crate::{
     CoordinatorToWorkerMsg, DistributedConfig, DistributedExt, DistributedTaskContext,
@@ -52,6 +52,22 @@ impl Worker {
         request: SetPlanRequest,
         stream: BoxStream<'static, Result<CoordinatorToWorkerMsg>>,
     ) -> Result<CoordinatorChannelResult> {
+        let _admission = self.admission.read().await;
+        if self.closed.is_cancelled() {
+            return Err(exec_datafusion_err!("Worker is shut down"));
+        }
+        tokio::select! {
+            result = self.open_coordinator_channel(headers, request, stream) => result,
+            _ = self.closed.cancelled() => Err(exec_datafusion_err!("Worker is shut down")),
+        }
+    }
+
+    async fn open_coordinator_channel(
+        &self,
+        headers: HeaderMap,
+        request: SetPlanRequest,
+        stream: BoxStream<'static, Result<CoordinatorToWorkerMsg>>,
+    ) -> Result<CoordinatorChannelResult> {
         let key = request.task_key;
 
         let entry = self
@@ -61,15 +77,27 @@ impl Worker {
 
         let mut remote_work_unit_feed_registry = RemoteWorkUnitFeedRegistry::default();
         for decl in request.work_unit_feed_declarations {
-            remote_work_unit_feed_registry.add(decl.id, decl.partitions);
+            remote_work_unit_feed_registry.add(
+                decl.id,
+                decl.partitions,
+                decl.demand,
+                &self.runtime.memory_pool,
+            );
         }
 
+        let (demand_tx, demand_rx) = tokio::sync::mpsc::unbounded_channel();
         let (metrics_tx, metrics_rx) = oneshot::channel();
         let (dynamic_filters_tx, dynamic_filters_rx) = oneshot::channel();
         let (dynamic_filters_error_tx, dynamic_filters_error_rx) = channel(1);
 
+        let memory = Arc::new(crate::protocol::PlanMemory::new(&self.runtime.memory_pool));
+        if let MaybeEncoded::Encoded(bytes) = &request.plan {
+            memory.retain(bytes.capacity())?;
+        }
         let task_data = || async {
             let mut cfg = SessionConfig::default()
+                .with_extension(Arc::clone(&memory))
+                .with_extension(Arc::new(Requester(demand_tx)))
                 .with_extension(Arc::new(remote_work_unit_feed_registry.receivers))
                 .with_extension(Arc::new(DistributedTaskContext {
                     task_index: request.task_key.task_number,
@@ -172,10 +200,13 @@ impl Worker {
         //    while loop inside this `tokio::spawn` below.
         // 5. The metrics and final dynamic filters are sent back in the worker->coordinator
         //    channel, and then that channel is closed.
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
+        let closed = self.closed.clone();
+        self.readers.spawn(async move {
             let mut stream = stream.map_ok(set_work_unit_received_time);
-            while let Some(Ok(msg)) = stream.next().await {
+            while let Some(Ok(msg)) = tokio::select! {
+                message = stream.next() => message,
+                _ = closed.cancelled() => None,
+            } {
                 match msg {
                     CoordinatorToWorkerMsg::WorkUnitBatch(work_unit_batch) => {
                         let Some(work_unit_senders) = work_unit_senders.as_mut() else {
@@ -187,7 +218,13 @@ impl Worker {
                             let Some(tx) = work_unit_senders.get(&(wu.id, partition)) else {
                                 continue;
                             };
-                            if tx.send(Ok(wu)).is_err() {
+                            if tx.credit.is_some() {
+                                let _ = dynamic_filters_error_tx.try_send(exec_datafusion_err!(
+                                    "Unsolicited eager work unit for demand feed {id}"
+                                ));
+                                break;
+                            }
+                            if tx.sender.send(Ok(wu)).is_err() {
                                 // Channel closed, this sender needs to be dropped, as none will ever
                                 // be listening on the other side.
                                 work_unit_senders.remove(&(id, partition));
@@ -203,7 +240,59 @@ impl Worker {
                         // The [WorkUnitEos] message just applies work units, and it's not a global
                         // EOS signal for the coordinator->worker stream, as there might be more
                         // messages of different nature in that stream.
-                        let _ = work_unit_senders.take();
+                        if let Some(senders) = &mut work_unit_senders {
+                            senders.retain(|_, tx| tx.credit.is_some());
+                        }
+                    }
+                    CoordinatorToWorkerMsg::WorkUnitResponse(response) => {
+                        let demand = response.demand;
+                        let result = (|| {
+                            let senders = work_unit_senders
+                                .as_mut()
+                                .ok_or_else(|| exec_datafusion_err!("Missing demand senders"))?;
+                            let tx =
+                                senders.get(&(demand.id, demand.partition)).ok_or_else(|| {
+                                    exec_datafusion_err!("Undeclared work unit response")
+                                })?;
+                            let credit = tx.credit.as_ref().ok_or_else(|| {
+                                exec_datafusion_err!("Demand response for eager feed")
+                            })?;
+                            credit
+                                .lock()
+                                .map_err(|_| exec_datafusion_err!("Demand credit poisoned"))?
+                                .respond(demand)?;
+                            match response.unit {
+                                Some(unit) => {
+                                    if unit.id != demand.id || unit.partition != demand.partition {
+                                        return Err(exec_datafusion_err!(
+                                            "Work unit response identity mismatch"
+                                        ));
+                                    }
+                                    let size = match &unit.body {
+                                        MaybeEncoded::Encoded(bytes) => bytes.capacity(),
+                                        MaybeEncoded::Decoded(value) => value.encoded_len(),
+                                    };
+                                    tx.memory.try_resize(
+                                        size.checked_mul(3)
+                                            .and_then(|size| size.checked_add(512))
+                                            .ok_or_else(|| {
+                                                exec_datafusion_err!("Descriptor size overflow")
+                                            })?,
+                                    )?;
+                                    tx.sender.send(Ok(unit)).map_err(|_| {
+                                        exec_datafusion_err!("Demand receiver closed")
+                                    })?;
+                                }
+                                None => {
+                                    senders.remove(&(demand.id, demand.partition));
+                                }
+                            }
+                            Ok::<_, DataFusionError>(())
+                        })();
+                        if let Err(error) = result {
+                            let _ = dynamic_filters_error_tx.try_send(error);
+                            break;
+                        }
                     }
                     CoordinatorToWorkerMsg::KickOffSampling => {
                         sampler_gate.kick_off();
@@ -232,6 +321,16 @@ impl Worker {
                             continue;
                         }
                     }
+                }
+            }
+
+            // A truncated channel is not a successful feed EOF. Only an explicit
+            // sequenced response may finish a demand partition.
+            if let Some(senders) = work_unit_senders {
+                for (_, tx) in senders {
+                    let _ = tx.sender.send(Err(exec_datafusion_err!(
+                        "Coordinator channel ended before work unit EOF"
+                    )));
                 }
             }
 
@@ -323,6 +422,9 @@ impl Worker {
         let dynamic_filters_error_stream = ReceiverStream::new(dynamic_filters_error_rx);
 
         let stream = select_all([
+            tokio_stream::wrappers::UnboundedReceiverStream::new(demand_rx)
+                .map(Ok)
+                .boxed(),
             produced_dynamic_filters_stream.map(Ok).boxed(),
             load_info_stream.map(Ok).boxed(),
             metrics_stream.map(Ok).boxed(),

@@ -162,18 +162,22 @@ impl pb::worker_service_server::WorkerService for Worker {
         };
         let mut flight_streams = Vec::with_capacity(arrow_streams.len());
         for (partition, arrow_stream) in partition_range.zip(arrow_streams) {
-            let flight_stream =
-                build_flight_data_stream(arrow_stream, compression)?.map(move |msg| {
-                    // For each FlightData produced by this stream, mark it with the appropriate
-                    // partition. This stream will be merged with several others from other partitions,
-                    // so marking it with the original partition allows it to be deconstructed into
-                    // the original per-partition streams in later steps.
-                    let flight_data = pb::FlightAppMetadata {
-                        partition: partition as u64,
-                        created_timestamp_unix_nanos: now_ns::<u64>(),
-                    };
-                    msg.map(|v| v.with_app_metadata(flight_data.encode_to_vec()))
-                });
+            let flight_stream = build_flight_data_stream(
+                arrow_stream,
+                compression,
+                self.max_message_size.unwrap_or(usize::MAX),
+            )?
+            .map(move |msg| {
+                // For each FlightData produced by this stream, mark it with the appropriate
+                // partition. This stream will be merged with several others from other partitions,
+                // so marking it with the original partition allows it to be deconstructed into
+                // the original per-partition streams in later steps.
+                let flight_data = pb::FlightAppMetadata {
+                    partition: partition as u64,
+                    created_timestamp_unix_nanos: now_ns::<u64>(),
+                };
+                msg.map(|v| v.with_app_metadata(flight_data.encode_to_vec()))
+            });
 
             flight_streams.push(flight_stream);
         }
@@ -214,6 +218,21 @@ fn decode_coordinator_to_worker_msg(
             }
             pb::coordinator_to_worker_msg::Inner::WorkUnitBatch(batch) => {
                 CoordinatorToWorkerMsg::WorkUnitBatch(decode_work_unit_batch(batch)?)
+            }
+            pb::coordinator_to_worker_msg::Inner::WorkUnitResponse(response) => {
+                let demand = response
+                    .demand
+                    .ok_or_else(missing("work_unit_response.demand"))?;
+                CoordinatorToWorkerMsg::WorkUnitResponse(crate::WorkUnitResponse {
+                    demand: crate::WorkUnitDemand {
+                        id: deserialize_uuid(&demand.id)
+                            .map_err(datafusion_error_to_tonic_status)?,
+                        partition: usize::try_from(demand.partition)
+                            .map_err(|_| Status::invalid_argument("Demand partition overflow"))?,
+                        sequence: demand.sequence,
+                    },
+                    unit: response.unit.map(decode_work_unit).transpose()?,
+                })
             }
             pb::coordinator_to_worker_msg::Inner::WorkUnitEos(_) => {
                 CoordinatorToWorkerMsg::WorkUnitEos
@@ -286,6 +305,11 @@ fn encode_worker_to_coordinator_msg(
 ) -> Result<pb::WorkerToCoordinatorMsg, Status> {
     Ok(pb::WorkerToCoordinatorMsg {
         inner: Some(match msg {
+            WorkerToCoordinatorMsg::WorkUnitDemand(demand) => {
+                pb::worker_to_coordinator_msg::Inner::WorkUnitDemand(
+                    super::worker_client::encode_work_unit_demand(demand),
+                )
+            }
             WorkerToCoordinatorMsg::TaskMetrics(task_metrics) => {
                 pb::worker_to_coordinator_msg::Inner::TaskMetrics(encode_task_metrics(
                     task_metrics,
@@ -405,6 +429,7 @@ fn decode_work_unit_feed_declaration(
     Ok(WorkUnitFeedDeclaration {
         id: deserialize_uuid(&declaration.id).map_err(datafusion_error_to_tonic_status)?,
         partitions: declaration.partitions as usize,
+        demand: declaration.demand,
     })
 }
 
@@ -432,6 +457,7 @@ fn missing(field: &'static str) -> impl FnOnce() -> Status {
 fn build_flight_data_stream(
     stream: SendableRecordBatchStream,
     compression_type: Option<CompressionType>,
+    size: usize,
 ) -> datafusion::common::Result<FlightDataEncoder, Status> {
     let stream = FlightDataEncoderBuilder::new()
         .with_options(
@@ -449,15 +475,9 @@ fn build_flight_data_stream(
         // Note that we do garbage collection of unused dictionary values above, so we are not sending
         // unused dictionary values over the wire.
         .with_dictionary_handling(DictionaryHandling::Resend)
-        // Set max flight data size to unlimited.
-        // This requires servers and clients to also be configured to handle unlimited sizes.
-        // Using unlimited sizes avoids splitting RecordBatches into multiple FlightData messages,
-        // which could add significant overhead for large RecordBatches.
-        // The only reason to split them really is if the client/server are configured with a message size limit,
-        // which mainly makes sense in a public network scenario where you want to avoid DoS attacks.
-        // Since all of our Arrow Flight communication happens within trusted data plane networks,
-        // we can safely use unlimited sizes here.
-        .with_max_flight_data_size(usize::MAX)
+        // A fragmentation target, not a transport rejection limit: one wide
+        // value may exceed it and is governed by byte admission on both ends.
+        .with_max_flight_data_size(size.max(1))
         .build(
             stream
                 // Apply garbage collection of dictionary and view arrays before sending over the network

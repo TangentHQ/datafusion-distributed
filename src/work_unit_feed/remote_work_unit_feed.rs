@@ -1,10 +1,12 @@
+use super::{Credit, Requester};
 use crate::common::now_ns;
 use crate::{
     BytesMetricExt, CoordinatorToWorkerMsg, LatencyMetricExt, MaybeEncoded, WorkUnit,
     WorkUnitBatch, WorkUnitMsg,
 };
-use datafusion::common::{HashMap, Result, exec_err};
+use datafusion::common::{HashMap, Result, exec_err, internal_datafusion_err};
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_expr_common::metrics::MetricBuilder;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_proto::protobuf::proto_error;
@@ -17,8 +19,18 @@ use uuid::Uuid;
 
 pub(crate) type WorkUnitTx = UnboundedSender<Result<WorkUnitMsg>>;
 pub(crate) type WorkUnitRx = UnboundedReceiver<Result<WorkUnitMsg>>;
-pub(crate) type RemoteWorkUnitFeedRxs = HashMap<(Uuid, usize), Mutex<Option<WorkUnitRx>>>;
-pub(crate) type RemoteWorkUnitFeedTxs = HashMap<(Uuid, usize), WorkUnitTx>;
+pub(crate) struct RemoteRx {
+    receiver: Mutex<Option<WorkUnitRx>>,
+    credit: Option<Arc<Mutex<Credit>>>,
+    memory: Arc<MemoryReservation>,
+}
+pub(crate) struct RemoteTx {
+    pub(crate) sender: WorkUnitTx,
+    pub(crate) credit: Option<Arc<Mutex<Credit>>>,
+    pub(crate) memory: Arc<MemoryReservation>,
+}
+pub(crate) type RemoteWorkUnitFeedRxs = HashMap<(Uuid, usize), RemoteRx>;
+pub(crate) type RemoteWorkUnitFeedTxs = HashMap<(Uuid, usize), RemoteTx>;
 
 /// Bridge between the worker's gRPC layer and the remote-variant
 /// [`crate::WorkUnitFeed`]s installed in the deserialized plan.
@@ -45,7 +57,13 @@ impl RemoteWorkUnitFeedRegistry {
     /// mean two plan nodes share a UUID, which would cause "already consumed" when both
     /// nodes call `feed()`. We skip rather than overwrite so the coordinator-side duplicate
     /// detection in `task_specialized_plan` surfaces the real error first.
-    pub(crate) fn add(&mut self, id: Uuid, partitions: usize) {
+    pub(crate) fn add(
+        &mut self,
+        id: Uuid,
+        partitions: usize,
+        demand: bool,
+        pool: &Arc<dyn MemoryPool>,
+    ) {
         for partition in 0..partitions {
             // Skip if already registered; overwriting would silently drop the existing
             // receiver and cause a confusing "already consumed" error at execution time.
@@ -53,8 +71,24 @@ impl RemoteWorkUnitFeedRegistry {
                 continue;
             }
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            self.receivers.insert((id, partition), Mutex::new(Some(rx)));
-            self.senders.insert((id, partition), tx);
+            let memory = Arc::new(MemoryConsumer::new("RemoteDescriptor").register(pool));
+            let credit = demand.then(|| Arc::new(Mutex::new(Credit::default())));
+            self.receivers.insert(
+                (id, partition),
+                RemoteRx {
+                    receiver: Mutex::new(Some(rx)),
+                    credit: credit.clone(),
+                    memory: Arc::clone(&memory),
+                },
+            );
+            self.senders.insert(
+                (id, partition),
+                RemoteTx {
+                    sender: tx,
+                    credit,
+                    memory,
+                },
+            );
         }
     }
 }
@@ -82,10 +116,18 @@ pub(crate) fn build_work_unit_batch_msg(
 }
 
 pub(crate) fn set_work_unit_send_time(mut msg: CoordinatorToWorkerMsg) -> CoordinatorToWorkerMsg {
-    if let CoordinatorToWorkerMsg::WorkUnitBatch(work_unit_batch) = &mut msg {
-        for work_unit in &mut work_unit_batch.batch {
-            work_unit.sent_timestamp_unix_nanos = now_ns();
+    match &mut msg {
+        CoordinatorToWorkerMsg::WorkUnitBatch(batch) => {
+            for unit in &mut batch.batch {
+                unit.sent_timestamp_unix_nanos = now_ns();
+            }
         }
+        CoordinatorToWorkerMsg::WorkUnitResponse(response) => {
+            if let Some(unit) = &mut response.unit {
+                unit.sent_timestamp_unix_nanos = now_ns();
+            }
+        }
+        _ => {}
     }
     msg
 }
@@ -93,10 +135,18 @@ pub(crate) fn set_work_unit_send_time(mut msg: CoordinatorToWorkerMsg) -> Coordi
 pub(crate) fn set_work_unit_received_time(
     mut msg: CoordinatorToWorkerMsg,
 ) -> CoordinatorToWorkerMsg {
-    if let CoordinatorToWorkerMsg::WorkUnitBatch(work_unit_batch) = &mut msg {
-        for work_unit in &mut work_unit_batch.batch {
-            work_unit.received_timestamp_unix_nanos = now_ns();
+    match &mut msg {
+        CoordinatorToWorkerMsg::WorkUnitBatch(batch) => {
+            for unit in &mut batch.batch {
+                unit.received_timestamp_unix_nanos = now_ns();
+            }
         }
+        CoordinatorToWorkerMsg::WorkUnitResponse(response) => {
+            if let Some(unit) = &mut response.unit {
+                unit.received_timestamp_unix_nanos = now_ns();
+            }
+        }
+        _ => {}
     }
     msg
 }
@@ -152,13 +202,52 @@ impl RemoteFeedProvider {
             );
         };
 
-        let Some(receiver) = std::mem::take(&mut *remote_feed.lock().unwrap()) else {
+        let Some(receiver) = std::mem::take(
+            &mut *remote_feed
+                .receiver
+                .lock()
+                .map_err(|_| internal_datafusion_err!("Work unit receiver is poisoned"))?,
+        ) else {
             return exec_err!(
                 "WorkUnit feed for id {id} and partition {partition} was already consumed"
             );
         };
 
-        Ok(UnboundedReceiverStream::new(receiver)
+        let stream = match &remote_feed.credit {
+            None => UnboundedReceiverStream::new(receiver).boxed(),
+            Some(credit) => {
+                let credit = Arc::clone(credit);
+                let memory = Arc::clone(&remote_feed.memory);
+                let requester = ctx
+                    .session_config()
+                    .get_extension::<Requester>()
+                    .ok_or_else(|| internal_datafusion_err!("Missing work unit demand channel"))?;
+                futures::stream::try_unfold(receiver, move |mut receiver| {
+                    let credit = Arc::clone(&credit);
+                    let memory = Arc::clone(&memory);
+                    let requester = Arc::clone(&requester);
+                    async move {
+                        memory.free();
+                        let demand = credit
+                            .lock()
+                            .map_err(|_| internal_datafusion_err!("Work unit credit is poisoned"))?
+                            .request(id, partition)?;
+                        requester
+                            .0
+                            .send(crate::WorkerToCoordinatorMsg::WorkUnitDemand(demand))
+                            .map_err(|_| {
+                                internal_datafusion_err!("Work unit demand channel closed")
+                            })?;
+                        match receiver.recv().await {
+                            Some(result) => Ok(Some((result?, receiver))),
+                            None => Ok(None),
+                        }
+                    }
+                })
+                .boxed()
+            }
+        };
+        Ok(stream
             .map(move |work_unit_msg_or_err| {
                 let mut work_unit_msg = work_unit_msg_or_err?;
                 let timer = elapsed_compute.timer();
@@ -193,14 +282,16 @@ impl RemoteFeedProvider {
 
                 msg_count.add(1);
 
-                send_latency_max.add_nanos(sent_timestamp_unix_nanos - base);
-                send_latency_p50.add_nanos(sent_timestamp_unix_nanos - base);
+                send_latency_max.add_nanos(sent_timestamp_unix_nanos.saturating_sub(base));
+                send_latency_p50.add_nanos(sent_timestamp_unix_nanos.saturating_sub(base));
 
-                received_latency_max.add_nanos(received_timestamp_unix_nanos - base);
-                received_latency_p50.add_nanos(received_timestamp_unix_nanos - base);
+                received_latency_max.add_nanos(received_timestamp_unix_nanos.saturating_sub(base));
+                received_latency_p50.add_nanos(received_timestamp_unix_nanos.saturating_sub(base));
 
-                processed_latency_max.add_nanos(processed_timestamp_unix_nanos - base);
-                processed_latency_p50.add_nanos(processed_timestamp_unix_nanos - base);
+                processed_latency_max
+                    .add_nanos(processed_timestamp_unix_nanos.saturating_sub(base));
+                processed_latency_p50
+                    .add_nanos(processed_timestamp_unix_nanos.saturating_sub(base));
 
                 Ok(work_unit)
             })
