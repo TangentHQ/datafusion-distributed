@@ -6,10 +6,11 @@ use crate::{
 use datafusion::arrow::array::Array;
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::HashSet;
+use datafusion::common::hash_utils::create_hashes_with_hasher;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, Result, exec_datafusion_err, exec_err};
-use datafusion::common::{HashSet, ScalarValue};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
@@ -21,7 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::stream::FusedStream;
-use futures::{Stream, StreamExt, TryFutureExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
@@ -33,7 +34,9 @@ use tokio::sync::{oneshot, watch};
 
 /// How many [RecordBatch]s to allow the input stream to yield synchronously (without yielding back
 /// to tokio) before short-circuiting buffering.
-const READY_CHUNK_LIMIT: usize = 1024 * 1024;
+const READY_CHUNK_LIMIT: usize = 64;
+/// Sampling is a bounded prefix, not a second materialization of the query.
+const READY_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of rows sampled from the peek queue when estimating per-column NDV.
 const NDV_MAX_ROWS_SAMPLE: usize = 1000;
 
@@ -293,26 +296,23 @@ impl PartitionSampler {
             // attempt must remain retryable without consuming upstream resources.
             let mut input_stream = input.execute(partition_idx, ctx)?.fuse();
 
-            // First, read at once all the RecordBatches that are ready to be yielded synchronously.
-            // Some downstream nodes will accumulate data in-memory, and will then yield several
-            // RecordBatches at once synchronously (without Poll::Pending gaps in between).
-            let Some(batches) = (&mut input_stream)
-                .ready_chunks(READY_CHUNK_LIMIT)
-                .next()
-                .await
-            else {
-                // The input produced nothing at all: the stream is exhausted, so this partition
-                // reached EOS with zero rows.
+            // Admit one batch before retaining it. `ready_chunks` first
+            // accumulated an uncharged Vec of every synchronously ready batch.
+            let Some(first) = input_stream.next().await else {
                 reporter.load_info.reached_eos = true;
                 reporter.report(&peek);
                 return Ok(peek.chain(input_stream).boxed());
             };
             let _guard = elapsed_compute.timer();
-
-            peek.reserve(batches.len());
             first_batch_at.get_or_init(Instant::now);
-            for batch in batches {
-                peek.push(batch?);
+            peek.push(first?)?;
+            while peek.peek.len() < READY_CHUNK_LIMIT
+                && peek.memory_reservation.size() < READY_BYTES
+            {
+                match input_stream.next().now_or_never() {
+                    Some(Some(batch)) => peek.push(batch?)?,
+                    Some(None) | None => break,
+                }
             }
             // If the input stream is already terminated, every batch it will ever produce is now in
             // `peek`, so this partition has reached EOS and its `rows_ready` / `bytes_ready` are
@@ -442,19 +442,16 @@ struct RecordBatchPeek {
 }
 
 impl RecordBatchPeek {
-    fn reserve(&mut self, size: usize) {
-        self.peek.reserve(size)
-    }
-
-    fn push(&mut self, batch: RecordBatch) {
+    fn push(&mut self, batch: RecordBatch) -> Result<()> {
         let batch_size = record_batch_size(&batch);
         if self.peek.is_empty() {
             let _ = self.first_batch_at.set(Instant::now());
         }
+        self.memory_reservation.try_grow(batch_size)?;
         self.max_mem_used.add(batch_size);
-        self.memory_reservation.grow(batch_size);
         self.peek.push_back(batch);
         self.max_batches_peeked.set_max(self.peek.len());
+        Ok(())
     }
 
     fn per_col_bytes_ready(&self) -> Vec<usize> {
@@ -477,44 +474,60 @@ impl RecordBatchPeek {
             return vec![0.0; self.n_cols];
         }
 
-        // Build the list of flat row indices to sample, sorted for cache-friendly access.
-        let sampled_indices: Vec<usize> = if total_rows <= NDV_MAX_ROWS_SAMPLE {
-            (0..total_rows).collect()
-        } else {
-            let mut indices =
-                rand::seq::index::sample(&mut rand::rng(), total_rows, NDV_MAX_ROWS_SAMPLE)
-                    .into_vec();
-            indices.sort_unstable();
-            indices
-        };
-        let rows_sampled = sampled_indices.len();
-
-        let mut sets: Vec<HashSet<ScalarValue>> = vec![HashSet::new(); self.n_cols];
-        let mut flat_base = 0usize;
-        let mut sample_pos = 0usize;
-
-        for batch in &self.peek {
-            let batch_end = flat_base + batch.num_rows();
-            while sample_pos < sampled_indices.len() && sampled_indices[sample_pos] < batch_end {
-                let row = sampled_indices[sample_pos] - flat_base;
-                for (col_idx, set) in sets.iter_mut().enumerate() {
-                    let col = batch.column(col_idx);
-                    if !col.is_null(row)
-                        && let Ok(v) = ScalarValue::try_from_array(col, row)
-                    {
-                        set.insert(v);
-                    }
-                }
-                sample_pos += 1;
-            }
-            if sample_pos >= sampled_indices.len() {
-                break;
-            }
-            flat_base = batch_end;
+        // Hash borrowed primitive values instead of cloning ScalarValue
+        // payloads. One hash set is reused per column, including very wide
+        // strings; NDV is a hint and can conservatively stay unknown when its
+        // scratch reservation cannot be admitted.
+        let scratch = self.memory_reservation.new_empty();
+        let bytes = NDV_MAX_ROWS_SAMPLE * (size_of::<usize>() + 4 * size_of::<u64>())
+            + self.n_cols * size_of::<f32>()
+            + 4096;
+        if scratch.try_grow(bytes).is_err() {
+            return vec![1.0; self.n_cols];
         }
-
-        sets.into_iter()
-            .map(|s| s.len() as f32 / rows_sampled as f32)
+        let mut indices = if total_rows <= NDV_MAX_ROWS_SAMPLE {
+            (0..total_rows).collect::<Vec<_>>()
+        } else {
+            rand::seq::index::sample(&mut rand::rng(), total_rows, NDV_MAX_ROWS_SAMPLE).into_vec()
+        };
+        indices.sort_unstable();
+        let state = std::collections::hash_map::RandomState::new();
+        let mut set = HashSet::<u64>::with_capacity(indices.len());
+        (0..self.n_cols)
+            .map(|column| {
+                set.clear();
+                let mut base = 0;
+                let mut position = 0;
+                for batch in &self.peek {
+                    let array = batch.column(column);
+                    // Nested hash kernels can allocate proportional to a child
+                    // array. Keep their NDV unknown rather than allocate scratch
+                    // outside the admitted fixed sample budget.
+                    if array.data_type().is_nested()
+                        || matches!(
+                            array.data_type(),
+                            datafusion::arrow::datatypes::DataType::Dictionary(_, _)
+                        )
+                    {
+                        return 1.0;
+                    }
+                    while position < indices.len() && indices[position] < base + batch.num_rows() {
+                        let row = indices[position] - base;
+                        if !array.is_null(row) {
+                            let mut hash = [0];
+                            if create_hashes_with_hasher([array.slice(row, 1)], &state, &mut hash)
+                                .is_err()
+                            {
+                                return 1.0;
+                            }
+                            set.insert(hash[0]);
+                        }
+                        position += 1;
+                    }
+                    base += batch.num_rows();
+                }
+                set.len() as f32 / indices.len() as f32
+            })
             .collect()
     }
 
@@ -616,5 +629,118 @@ impl ExecutionPlan for SamplerExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metric_set.clone_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use futures::TryStreamExt;
+
+    fn peek(pool: &Arc<dyn MemoryPool>) -> RecordBatchPeek {
+        RecordBatchPeek {
+            peek: VecDeque::new(),
+            n_cols: 1,
+            max_batches_peeked: MaxGaugeMetric::default(),
+            max_mem_used: Gauge::new(),
+            memory_reservation: Arc::new(MemoryConsumer::new("test sampler").register(pool)),
+            first_batch_at: Arc::new(OnceLock::new()),
+        }
+    }
+
+    #[test]
+    fn retention_rejects_pressure_and_releases_all_admitted_bytes() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![1; 1024])) as ArrayRef,
+        )])
+        .unwrap();
+        let bytes = record_batch_size(&batch);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let mut queue = peek(&pool);
+        queue.push(batch.clone()).unwrap();
+        assert!(queue.push(batch).is_err());
+        assert_eq!(queue.rows_ready(), 1024);
+        assert_eq!(pool.reserved(), bytes);
+        drop(queue);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn wide_ndv_hashes_borrow_values_and_pressure_keeps_a_conservative_hint() {
+        let value = "wide".repeat(64 * 1024);
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(StringArray::from(vec![
+                Some(value.as_str()),
+                Some(value.as_str()),
+                None,
+            ])) as ArrayRef,
+        )])
+        .unwrap();
+        let bytes = record_batch_size(&batch);
+        for room in [0, 128 * 1024] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes + room));
+            let mut queue = peek(&pool);
+            queue.push(batch.clone()).unwrap();
+            assert_eq!(
+                queue.per_col_ndv(),
+                vec![if room == 0 { 1.0 } else { 1.0 / 3.0 }]
+            );
+            assert_eq!(
+                pool.reserved(),
+                bytes,
+                "NDV scratch is released after reporting"
+            );
+            drop(queue);
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_input_samples_a_bounded_prefix_then_preserves_every_row_in_order() {
+        let batches = (0..512)
+            .map(|index| {
+                RecordBatch::try_from_iter([(
+                    "value",
+                    Arc::new(Int64Array::from(vec![index])) as ArrayRef,
+                )])
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let source =
+            MemorySourceConfig::try_new_exec(&[batches.clone()], batches[0].schema(), None)
+                .unwrap();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SamplerExec::new(source));
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(128 * 1024));
+        let runtime = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(pool.clone())
+                .build()
+                .unwrap(),
+        );
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime).task_ctx();
+        let mut gate = SamplerExec::gate_for_first_sampler(plan.clone(), ctx.clone()).unwrap();
+        let report = gate.take_receivers().pop().unwrap();
+        gate.kick_off();
+        let report = report.await.unwrap();
+        assert!(
+            report.rows_ready > 0 && report.rows_ready < 512,
+            "sampling cannot drain all ready input"
+        );
+        let output = plan
+            .execute(0, ctx)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output, batches);
+        drop(plan);
+        assert_eq!(pool.reserved(), 0);
     }
 }
