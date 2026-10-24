@@ -1,4 +1,6 @@
 mod channel_resolver;
+mod decode;
+mod encode;
 mod errors;
 mod generated;
 mod metrics_proto;

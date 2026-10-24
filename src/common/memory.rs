@@ -29,6 +29,24 @@ pub(crate) fn hold_bytes<T: Send + Sync + 'static>(bytes: Bytes, memory: Arc<T>)
     })
 }
 
+pub(crate) fn schema_bytes(schema: &datafusion::arrow::datatypes::Schema) -> usize {
+    schema
+        .fields()
+        .size()
+        .saturating_add(std::mem::size_of_val(schema))
+        .saturating_add(
+            schema
+                .metadata()
+                .iter()
+                .map(|(key, value)| {
+                    key.capacity()
+                        .saturating_add(value.capacity())
+                        .saturating_add(96)
+                })
+                .sum::<usize>(),
+        )
+}
+
 pub(crate) fn allocation_bytes(
     batch: &RecordBatch,
     covered: impl Fn(usize, usize) -> bool,
@@ -41,8 +59,8 @@ pub(crate) fn allocation_bytes(
         {
             buffers
                 .entry(buffer.data_ptr().as_ptr() as usize)
-                .and_modify(|size| *size = (*size).max(buffer.capacity()))
-                .or_insert(buffer.capacity());
+                .and_modify(|size| *size = (*size).max(buffer.capacity().max(buffer.len())))
+                .or_insert(buffer.capacity().max(buffer.len()));
         }
         for child in data.child_data() {
             visit(child, buffers);

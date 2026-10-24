@@ -39,6 +39,28 @@ governs *what work flows into each partition at runtime*.
 > count* for the node — that is the `DesiredTaskCountHandler`'s job. Without it the leaf defaults
 > to a single task. See [Distribute a custom `ExecutionPlan`](../user-guide/04-distribute-custom-plan.md).
 
+## Demand-driven frozen scans
+
+`WorkUnitFeed::new(provider).with_demand()` opts into one outstanding descriptor
+per task/feed/partition. The coordinator polls a provider partition only when
+its remote consumer asks for the next descriptor; the consumer must fully drain
+the previous descriptor before polling again. An explicit sequenced empty
+response ends a partition. Existing feeds retain their eager delivery behavior.
+
+For a frozen file inventory, provider partitions can share one cursor over that
+inventory. A worker that finishes its current file then takes the next unread
+file, rather than waiting for a slower worker's static assignment. Freeze and
+authorize membership before creating the feed; descriptors carry identity, not
+new storage authority. Ordered SQL operators still own result ordering.
+
+Demands are bound to the exact query task, feed UUID, partition and sequence.
+Duplicate, concurrent and stale requests fail the query. A lost response or
+worker failure is not retried or reassigned by the feed: the enclosing query
+attempt owns recovery. Dropping the query cancels feed admission, and
+`Worker::shutdown().await` joins the worker's coordinator readers before its
+runtime is reclaimed. Returned Flight bytes and Arrow children retain their
+memory owners independently of those readers and queue credits.
+
 ## How it works
 
 A feed produces one stream of work units per partition. Inside the node's `execute()`, each partition pulls

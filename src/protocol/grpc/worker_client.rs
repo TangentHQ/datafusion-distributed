@@ -3,7 +3,7 @@ use super::errors::datafusion_error_to_tonic_status;
 use super::errors::{map_flight_to_datafusion_error, map_status_to_datafusion_error};
 use super::generated::worker as pb;
 use super::metrics_proto::metrics_set_proto_to_df;
-use crate::common::memory::{allocation_bytes, hold_batch, hold_bytes};
+use crate::common::memory::hold_bytes;
 use crate::common::{RetryOutcome, deserialize_uuid, on_drop_stream, serialize_uuid};
 use crate::grpc::errors::tonic_status_to_datafusion_error;
 use crate::grpc::generated::worker::FlightAppMetadata;
@@ -16,7 +16,6 @@ use crate::{
     WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
 };
 use arrow_flight::FlightData;
-use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
@@ -401,27 +400,27 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 let _ = &task; // <- keep the task that polls data from the network alive.
                 data
             });
-            let stream = FlightRecordBatchStream::new_from_flight_data(stream);
-            let stream = stream.map_err(map_flight_to_datafusion_error);
             let frames = Arc::clone(&frames);
-            let decoded = MemoryConsumer::new("WorkerDecode").register(ctx.memory_pool());
-            let stream = stream.and_then(move |batch| {
-                let memory = decoded.new_empty();
+            let mut decoder = super::decode::Decoder::new(Arc::clone(ctx.memory_pool()));
+            let stream = stream.filter_map(move |message| {
                 let result = (|| {
+                    let data = message.map_err(map_flight_to_datafusion_error)?;
                     let frames = frames.lock().map_err(|_| {
                         DataFusionError::Execution("Flight memory registry is unavailable".into())
                     })?;
-                    let bytes = allocation_bytes(&batch, |start, length| {
+                    decoder.decode(data, |start, length| {
                         frames
                             .values
                             .iter()
                             .filter_map(Weak::upgrade)
                             .any(|frame| frame.contains(start, length))
-                    });
-                    memory.try_grow(bytes)?;
-                    hold_batch(batch, memory)
+                    })
                 })();
-                ready(result)
+                ready(match result {
+                    Ok(Some(batch)) => Some(Ok(batch)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                })
             });
             let stream = stream.with_elapsed_compute(elapsed_compute_clone.clone());
 

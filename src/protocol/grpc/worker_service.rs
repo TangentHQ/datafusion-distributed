@@ -14,14 +14,12 @@ use crate::{
 
 use crate::worker::CoordinatorChannelResult;
 use arrow_flight::FlightData;
-use arrow_flight::encode::{DictionaryHandling, FlightDataEncoder, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
 use arrow_select::dictionary::garbage_collect_any_dictionary;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions};
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::ipc::CompressionType;
-use datafusion::arrow::ipc::writer::IpcWriteOptions;
 use datafusion::common::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_proto::protobuf;
@@ -166,6 +164,7 @@ impl pb::worker_service_server::WorkerService for Worker {
                 arrow_stream,
                 compression,
                 self.max_message_size.unwrap_or(usize::MAX),
+                Arc::clone(task_ctx.memory_pool()),
             )?
             .map(move |msg| {
                 // For each FlightData produced by this stream, mark it with the appropriate
@@ -176,7 +175,7 @@ impl pb::worker_service_server::WorkerService for Worker {
                     partition: partition as u64,
                     created_timestamp_unix_nanos: now_ns::<u64>(),
                 };
-                msg.map(|v| v.with_app_metadata(flight_data.encode_to_vec()))
+                msg.map(|v| v.metadata(flight_data.encode_to_vec()))
             });
 
             flight_streams.push(flight_stream);
@@ -184,8 +183,7 @@ impl pb::worker_service_server::WorkerService for Worker {
 
         // Merge all the per-partition streams into one. Each message in the stream is marked with
         // the original partition, so they can be reconstructed at the other side of the boundary.
-        let memory_pool = Arc::clone(&task_ctx.runtime_env().memory_pool);
-        let stream = spawn_select_all(flight_streams, memory_pool, RECORD_BATCH_BUFFER_SIZE);
+        let stream = spawn_select_all(flight_streams, RECORD_BATCH_BUFFER_SIZE);
 
         Ok(Response::new(Box::pin(stream.map_err(|err| match err {
             FlightError::Tonic(status) => *status,
@@ -456,35 +454,14 @@ fn missing(field: &'static str) -> impl FnOnce() -> Status {
 
 fn build_flight_data_stream(
     stream: SendableRecordBatchStream,
-    compression_type: Option<CompressionType>,
+    compression: Option<CompressionType>,
     size: usize,
-) -> datafusion::common::Result<FlightDataEncoder, Status> {
-    let stream = FlightDataEncoderBuilder::new()
-        .with_options(
-            IpcWriteOptions::default()
-                .try_with_compression(compression_type)
-                .map_err(|err| Status::internal(err.to_string()))?,
-        )
-        .with_schema(stream.schema())
-        // This tells the encoder to send dictionaries across the wire as-is.
-        // The alternative (`DictionaryHandling::Hydrate`) would expand the dictionaries
-        // into their value types, which can potentially blow up the size of the data transfer.
-        // The main reason to use `DictionaryHandling::Hydrate` is for compatibility with clients
-        // that do not support dictionaries, but since we are using the same server/client on both
-        // sides, we can safely use `DictionaryHandling::Resend`.
-        // Note that we do garbage collection of unused dictionary values above, so we are not sending
-        // unused dictionary values over the wire.
-        .with_dictionary_handling(DictionaryHandling::Resend)
-        // A fragmentation target, not a transport rejection limit: one wide
-        // value may exceed it and is governed by byte admission on both ends.
-        .with_max_flight_data_size(size.max(1))
-        .build(
-            stream
-                // Apply garbage collection of dictionary and view arrays before sending over the network
-                .and_then(|rb| std::future::ready(garbage_collect_arrays(rb)))
-                .map_err(|err| FlightError::Tonic(Box::new(datafusion_error_to_tonic_status(err)))),
-        );
-    Ok(stream)
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) -> datafusion::common::Result<
+    BoxStream<'static, Result<super::encode::Encoded, FlightError>>,
+    Status,
+> {
+    super::encode::encode(stream, pool, compression, size).map_err(datafusion_error_to_tonic_status)
 }
 
 /// Garbage collects values sub-arrays.
@@ -494,7 +471,7 @@ fn build_flight_data_stream(
 ///
 /// Unused values can arise from operations such as filtering, where
 /// some keys may no longer be referenced in the filtered result.
-fn garbage_collect_arrays(
+pub(super) fn garbage_collect_arrays(
     batch: RecordBatch,
 ) -> datafusion::common::Result<RecordBatch, DataFusionError> {
     let (schema, arrays, row_count) = batch.into_parts();
@@ -502,12 +479,26 @@ fn garbage_collect_arrays(
     let arrays = arrays
         .into_iter()
         .map(|array| {
-            if let Some(array) = array.as_any_dictionary_opt() {
-                garbage_collect_any_dictionary(array)
-            } else if let Some(array) = array.as_string_view_opt() {
-                Ok(Arc::new(array.gc()) as Arc<dyn Array>)
-            } else if let Some(array) = array.as_binary_view_opt() {
-                Ok(Arc::new(array.gc()) as Arc<dyn Array>)
+            if let Some(dictionary) = array.as_any_dictionary_opt() {
+                if dictionary.values().len().saturating_mul(16)
+                    < dictionary.values().get_buffer_memory_size()
+                {
+                    garbage_collect_any_dictionary(dictionary)
+                } else {
+                    Ok(array)
+                }
+            } else if let Some(view) = array.as_string_view_opt() {
+                if view.total_buffer_bytes_used() < view.get_buffer_memory_size() {
+                    Ok(Arc::new(view.gc()) as Arc<dyn Array>)
+                } else {
+                    Ok(array)
+                }
+            } else if let Some(view) = array.as_binary_view_opt() {
+                if view.total_buffer_bytes_used() < view.get_buffer_memory_size() {
+                    Ok(Arc::new(view.gc()) as Arc<dyn Array>)
+                } else {
+                    Ok(array)
+                }
             } else {
                 Ok(array)
             }

@@ -40,22 +40,20 @@ impl Demands {
             .feeds
             .lock()
             .map_err(|_| internal_datafusion_err!("Demand registry is poisoned"))?;
-        if feeds
-            .insert(
-                (task, id, partition),
-                Arc::new(Mutex::new(State {
-                    sequence: 0,
-                    feed: Some(feed),
-                    ended: false,
-                    memory: Arc::new(MemoryConsumer::new("DemandDescriptor").register(pool)),
-                })),
-            )
-            .is_some()
-        {
+        if feeds.contains_key(&(task, id, partition)) {
             return exec_err!(
                 "Duplicate demand feed for task {task:?}, feed {id}, partition {partition}"
             );
         }
+        feeds.insert(
+            (task, id, partition),
+            Arc::new(Mutex::new(State {
+                sequence: 0,
+                feed: Some(feed),
+                ended: false,
+                memory: Arc::new(MemoryConsumer::new("DemandDescriptor").register(pool)),
+            })),
+        );
         Ok(())
     }
 
@@ -447,7 +445,7 @@ mod tests {
         let mut retained = None;
         while let Some(result) = consumers.join_next().await {
             for batch in result.unwrap()? {
-                retained = Some(batch.column(0).slice(0,1));
+                retained = Some(batch.column(0).slice(0, 1));
                 let values = batch
                     .column(0)
                     .as_any()
@@ -468,16 +466,22 @@ mod tests {
             ids.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             (1..=8).map(|id| format!("frozen:{id}")).collect::<Vec<_>>()
         );
-        for worker in &workers { worker.shutdown().await; }
-        drop(senders); drop(feeds); drop(feed);
-        forwarders.abort_all(); while forwarders.join_next().await.is_some() {}
-        servers.abort_all(); while servers.join_next().await.is_some() {}
+        for worker in &workers {
+            worker.shutdown().await;
+        }
+        drop(senders);
+        drop(feeds);
+        drop(feed);
+        forwarders.abort_all();
+        while forwarders.join_next().await.is_some() {}
+        servers.abort_all();
+        while servers.join_next().await.is_some() {}
         drop(workers);
         let pool = Arc::clone(ctx.memory_pool());
         drop(ctx);
-        assert!(pool.reserved()>0,"projected child lost its byte owner");
+        assert!(pool.reserved() > 0, "projected child lost its byte owner");
         drop(retained);
-        assert_eq!(pool.reserved(),0,"shutdown retained query buffers");
+        assert_eq!(pool.reserved(), 0, "shutdown retained query buffers");
         Ok(())
     }
 }
