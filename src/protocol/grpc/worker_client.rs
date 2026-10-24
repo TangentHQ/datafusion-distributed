@@ -837,10 +837,20 @@ fn fanout(o_txs: &[UnboundedSender<WorkerMsg>], err: Status) {
 /// }
 /// ```
 pub fn create_worker_client(channel: BoxCloneSyncChannel) -> Box<dyn WorkerChannel> {
+    create_worker_client_with_limit(channel, usize::MAX)
+}
+
+/// Configure a finite encoded-message ceiling independently of the Flight
+/// encoder's fragmentation target. The caller derives this ceiling from its
+/// admitted worker envelope, including protobuf framing overhead.
+pub fn create_worker_client_with_limit(
+    channel: BoxCloneSyncChannel,
+    limit: usize,
+) -> Box<dyn WorkerChannel> {
     Box::new(
         pb::worker_service_client::WorkerServiceClient::new(channel)
-            .max_decoding_message_size(usize::MAX)
-            .max_encoding_message_size(usize::MAX),
+            .max_decoding_message_size(limit)
+            .max_encoding_message_size(limit),
     )
 }
 
