@@ -66,7 +66,8 @@ pub use stage::{
     DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,
 };
 pub use work_unit_feed::{
-    DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
+    DistributedWorkUnitFeedContext, Feedback, OwnedWorkUnit, WorkUnit, WorkUnitFeed,
+    WorkUnitFeedProto, WorkUnitFeedProvider,
 };
 pub use worker::{
     CoordinatorChannelResult, DefaultSessionBuilder, MappedWorkerSessionBuilder,

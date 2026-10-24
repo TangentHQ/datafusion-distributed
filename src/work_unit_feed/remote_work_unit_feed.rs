@@ -17,17 +17,68 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
-pub(crate) type WorkUnitTx = UnboundedSender<Result<WorkUnitMsg>>;
-pub(crate) type WorkUnitRx = UnboundedReceiver<Result<WorkUnitMsg>>;
+pub(crate) struct HeldWorkUnit {
+    unit: WorkUnitMsg,
+    memory: MemoryReservation,
+}
+
+/// A decoded work unit and its independently retained admission. Polling the
+/// next credit, cancelling a feed, or dropping its task cannot release this
+/// charge while the consumer still owns the value.
+pub struct OwnedWorkUnit<T> {
+    value: T,
+    memory: Arc<MemoryReservation>,
+}
+
+impl<T> std::ops::Deref for OwnedWorkUnit<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> OwnedWorkUnit<T> {
+    pub(crate) fn new(value: T, memory: MemoryReservation) -> Self {
+        Self {
+            value,
+            memory: Arc::new(memory),
+        }
+    }
+    pub fn memory(&self) -> Arc<MemoryReservation> {
+        Arc::clone(&self.memory)
+    }
+    pub(crate) fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+pub(crate) type WorkUnitTx = UnboundedSender<Result<HeldWorkUnit>>;
+pub(crate) type WorkUnitRx = UnboundedReceiver<Result<HeldWorkUnit>>;
 pub(crate) struct RemoteRx {
     receiver: Mutex<Option<WorkUnitRx>>,
     credit: Option<Arc<Mutex<Credit>>>,
-    memory: Arc<MemoryReservation>,
 }
 pub(crate) struct RemoteTx {
     pub(crate) sender: WorkUnitTx,
     pub(crate) credit: Option<Arc<Mutex<Credit>>>,
-    pub(crate) memory: Arc<MemoryReservation>,
+    pool: Arc<dyn MemoryPool>,
+}
+
+impl RemoteTx {
+    pub(crate) fn send(&self, unit: WorkUnitMsg) -> Result<()> {
+        let size = match &unit.body {
+            MaybeEncoded::Encoded(bytes) => bytes.capacity(),
+            MaybeEncoded::Decoded(value) => value.encoded_len(),
+        };
+        let memory = MemoryConsumer::new("QueuedWorkUnit").register(&self.pool);
+        memory.try_grow(
+            size.checked_add(512)
+                .ok_or_else(|| internal_datafusion_err!("Work unit size overflow"))?,
+        )?;
+        self.sender
+            .send(Ok(HeldWorkUnit { unit, memory }))
+            .map_err(|_| internal_datafusion_err!("Work unit receiver closed"))
+    }
 }
 pub(crate) type RemoteWorkUnitFeedRxs = HashMap<(Uuid, usize), RemoteRx>;
 pub(crate) type RemoteWorkUnitFeedTxs = HashMap<(Uuid, usize), RemoteTx>;
@@ -71,14 +122,12 @@ impl RemoteWorkUnitFeedRegistry {
                 continue;
             }
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let memory = Arc::new(MemoryConsumer::new("RemoteDescriptor").register(pool));
             let credit = demand.then(|| Arc::new(Mutex::new(Credit::default())));
             self.receivers.insert(
                 (id, partition),
                 RemoteRx {
                     receiver: Mutex::new(Some(rx)),
                     credit: credit.clone(),
-                    memory: Arc::clone(&memory),
                 },
             );
             self.senders.insert(
@@ -86,7 +135,7 @@ impl RemoteWorkUnitFeedRegistry {
                 RemoteTx {
                     sender: tx,
                     credit,
-                    memory,
+                    pool: Arc::clone(pool),
                 },
             );
         }
@@ -170,7 +219,9 @@ impl RemoteFeedProvider {
         &self,
         partition: usize,
         ctx: Arc<TaskContext>,
-    ) -> Result<BoxStream<'static, Result<T>>> {
+        feedback: bool,
+        bound: fn(&[u8]) -> Result<usize>,
+    ) -> Result<BoxStream<'static, Result<OwnedWorkUnit<T>>>> {
         let bdr = || MetricBuilder::new(&self.metrics);
 
         let bytes_transferred = bdr().bytes_counter("work_unit_bytes");
@@ -217,17 +268,22 @@ impl RemoteFeedProvider {
             None => UnboundedReceiverStream::new(receiver).boxed(),
             Some(credit) => {
                 let credit = Arc::clone(credit);
-                let memory = Arc::clone(&remote_feed.memory);
+                {
+                    let mut credit = credit
+                        .lock()
+                        .map_err(|_| internal_datafusion_err!("Work unit credit is poisoned"))?;
+                    credit.required = feedback;
+                    credit.memory =
+                        Some(MemoryConsumer::new("WorkUnitFeedback").register(ctx.memory_pool()));
+                }
                 let requester = ctx
                     .session_config()
                     .get_extension::<Requester>()
                     .ok_or_else(|| internal_datafusion_err!("Missing work unit demand channel"))?;
                 futures::stream::try_unfold(receiver, move |mut receiver| {
                     let credit = Arc::clone(&credit);
-                    let memory = Arc::clone(&memory);
                     let requester = Arc::clone(&requester);
                     async move {
-                        memory.free();
                         let demand = credit
                             .lock()
                             .map_err(|_| internal_datafusion_err!("Work unit credit is poisoned"))?
@@ -249,12 +305,24 @@ impl RemoteFeedProvider {
         };
         Ok(stream
             .map(move |work_unit_msg_or_err| {
-                let mut work_unit_msg = work_unit_msg_or_err?;
+                let HeldWorkUnit {
+                    unit: mut work_unit_msg,
+                    memory,
+                } = work_unit_msg_or_err?;
+                let reserved = memory.size();
                 let timer = elapsed_compute.timer();
                 let work_unit = match work_unit_msg.body {
                     MaybeEncoded::Encoded(bytes) => {
                         bytes_transferred.add_bytes(bytes.len());
-                        T::decode(bytes.as_slice()).map_err(|err| proto_error(format!("{err}")))?
+                        // The leaf supplies a schema-specific bound. Admission
+                        // happens before prost allocates the decoded message.
+                        let decoded = bound(&bytes)?;
+                        memory.try_grow(decoded)?;
+                        let value = T::decode(bytes.as_slice())
+                            .map_err(|err| proto_error(format!("{err}")))?;
+                        drop(bytes);
+                        memory.shrink(reserved);
+                        value
                     }
                     MaybeEncoded::Decoded(work_unit) => {
                         let work_unit = work_unit.into_any();
@@ -264,6 +332,14 @@ impl RemoteFeedProvider {
                                 std::any::type_name::<T>()
                             );
                         };
+                        let size = work_unit.encoded_len();
+                        memory.try_grow(size)?;
+                        let encoded = work_unit.encode_to_bytes();
+                        let decoded = bound(&encoded)?;
+                        memory.try_resize(reserved.checked_add(decoded).ok_or_else(|| {
+                            internal_datafusion_err!("Work unit size overflow")
+                        })?)?;
+                        drop(encoded);
                         in_memory_transferred.add(1);
                         *work_unit
                     }
@@ -293,12 +369,119 @@ impl RemoteFeedProvider {
                 processed_latency_p50
                     .add_nanos(processed_timestamp_unix_nanos.saturating_sub(base));
 
-                Ok(work_unit)
+                Ok(OwnedWorkUnit {
+                    value: work_unit,
+                    memory: Arc::new(memory),
+                })
             })
             .boxed())
     }
 
+    pub(crate) fn complete(
+        &self,
+        partition: usize,
+        ctx: Arc<TaskContext>,
+        body: bytes::Bytes,
+    ) -> Result<()> {
+        let feeds = ctx
+            .session_config()
+            .get_extension::<RemoteWorkUnitFeedRxs>()
+            .ok_or_else(|| internal_datafusion_err!("Missing remote work unit feeds"))?;
+        let credit = feeds
+            .get(&(self.id, partition))
+            .and_then(|feed| feed.credit.as_ref())
+            .ok_or_else(|| internal_datafusion_err!("Completion requires demand feed"))?;
+        credit
+            .lock()
+            .map_err(|_| internal_datafusion_err!("Work unit credit is poisoned"))?
+            .complete(body)
+    }
+
     pub(crate) fn metrics(&self) -> ExecutionPlanMetricsSet {
         self.metrics.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::execution::{
+        context::SessionContext, memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder,
+    };
+    use datafusion::prelude::SessionConfig;
+    use futures::TryStreamExt;
+    use prost::Message;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct Piece {
+        #[prost(bytes = "vec", tag = "1")]
+        body: Vec<u8>,
+    }
+
+    fn bound(bytes: &[u8]) -> Result<usize> {
+        bytes
+            .len()
+            .checked_add(128)
+            .ok_or_else(|| internal_datafusion_err!("piece too large"))
+    }
+
+    // Advancing or dropping the feed cannot release the prior piece's bytes.
+    // A failed predecode admission must drop the queued allocation as well.
+    #[tokio::test]
+    async fn returned_pieces_keep_independent_charges_after_eof_and_cancellation() -> Result<()> {
+        for (budget, cancelled) in [(1600, false), (64 * 1024, false), (64 * 1024, true)] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(budget));
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(pool.clone())
+                .build_arc()?;
+            let id = Uuid::new_v4();
+            let mut registry = RemoteWorkUnitFeedRegistry::default();
+            registry.add(id, 1, false, &pool);
+            let tx = registry.senders.remove(&(id, 0)).unwrap();
+            let encoded = Piece {
+                body: vec![17; 800],
+            }
+            .encode_to_vec();
+            tx.send(WorkUnitMsg {
+                id,
+                partition: 0,
+                body: MaybeEncoded::Encoded(encoded),
+                created_timestamp_unix_nanos: 0,
+                sent_timestamp_unix_nanos: 0,
+                received_timestamp_unix_nanos: 0,
+                processed_timestamp_unix_nanos: 0,
+            })?;
+            drop(tx);
+            let config = SessionConfig::new().with_extension(Arc::new(registry.receivers));
+            let ctx = SessionContext::new_with_config_rt(config, runtime).task_ctx();
+            let provider = RemoteFeedProvider {
+                id,
+                metrics: ExecutionPlanMetricsSet::new(),
+            };
+            let mut stream = provider.feed::<Piece>(0, ctx, false, bound)?;
+            if budget == 1600 {
+                // Encoded queue fits, but the additional decoded body does not.
+                assert!(stream.try_next().await.is_err());
+                drop(stream);
+                assert_eq!(pool.reserved(), 0);
+                continue;
+            }
+            let piece = stream.try_next().await?.unwrap();
+            assert_eq!(piece.body.as_slice(), vec![17; 800]);
+            let charged = pool.reserved();
+            assert!(charged >= piece.body.capacity());
+            if !cancelled {
+                assert!(stream.try_next().await?.is_none());
+            }
+            drop(stream);
+            assert_eq!(
+                pool.reserved(),
+                charged,
+                "EOF cannot release the returned piece"
+            );
+            drop(piece);
+            assert_eq!(pool.reserved(), 0);
+        }
+        Ok(())
     }
 }

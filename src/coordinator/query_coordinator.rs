@@ -518,6 +518,10 @@ impl<'a> StageCoordinator<'a> {
                             partition,
                             wuf.feed(partitions * d_ctx.task_index + partition, Arc::clone(&ctx))?,
                             ctx.memory_pool(),
+                            wuf.feedback(
+                                partitions * d_ctx.task_index + partition,
+                                Arc::clone(&ctx),
+                            )?,
                         )?;
                     }
                 }

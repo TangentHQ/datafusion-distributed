@@ -228,6 +228,7 @@ fn decode_coordinator_to_worker_msg(
                         partition: usize::try_from(demand.partition)
                             .map_err(|_| Status::invalid_argument("Demand partition overflow"))?,
                         sequence: demand.sequence,
+                        feedback: demand.feedback.map(bytes::Bytes::from),
                     },
                     unit: response.unit.map(decode_work_unit).transpose()?,
                 })

@@ -81,6 +81,7 @@ message WorkUnitDemand {
   bytes id = 1;
   uint64 partition = 2;
   uint64 sequence = 3;
+  optional bytes feedback = 4;
 }
 message WorkUnitResponse {
   WorkUnitDemand demand = 1;

@@ -15,4 +15,6 @@ pub(crate) use work_unit_feed_registry::{WorkUnitFeedRegistry, set_distributed_w
 
 pub use work_unit::WorkUnit;
 pub use work_unit_feed::{WorkUnitFeed, WorkUnitFeedProto};
-pub use work_unit_feed_provider::{DistributedWorkUnitFeedContext, WorkUnitFeedProvider};
+pub use work_unit_feed_provider::{DistributedWorkUnitFeedContext, Feedback, WorkUnitFeedProvider};
+
+pub use remote_work_unit_feed::OwnedWorkUnit;

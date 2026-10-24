@@ -656,6 +656,7 @@ pub(super) fn encode_work_unit_demand(demand: crate::WorkUnitDemand) -> pb::Work
         id: serialize_uuid(&demand.id),
         partition: demand.partition as u64,
         sequence: demand.sequence,
+        feedback: demand.feedback.map(|body| body.to_vec()),
     }
 }
 
@@ -713,6 +714,7 @@ fn decode_worker_to_coordinator_msg(
                         datafusion::common::exec_datafusion_err!("Demand partition overflow")
                     })?,
                     sequence: demand.sequence,
+                    feedback: demand.feedback.map(bytes::Bytes::from),
                 })
             }
             pb::worker_to_coordinator_msg::Inner::TaskMetrics(task_metrics) => {

@@ -35,7 +35,7 @@ pub struct RowGeneratorWorkUnit {
     #[prost(uint64, tag = "1")]
     n_rows: u64,
     #[prost(uint64, tag = "2")]
-    identity: u64,
+    pub(crate) identity: u64,
 }
 
 /// A scripted operation that the [`RowGeneratorFeedProvider`] performs on the
@@ -458,7 +458,10 @@ impl ExecutionPlan for RowGeneratorExec {
         let projection = self.projection.clone();
 
         let gate = context.session_config().get_extension::<ScanGate>();
+        let feedback = self.feed.feedback.then(|| self.feed.clone());
         let stream = work_unit_feed.then(move |msg_result| {
+            let feedback = feedback.clone();
+            let context = context.clone();
             let gate = gate.clone();
             let tag = tag.clone();
             let projection = projection.clone();
@@ -494,6 +497,13 @@ impl ExecutionPlan for RowGeneratorExec {
                     None => all_columns,
                 };
                 let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+                if let Some(feed) = feedback {
+                    feed.complete(
+                        partition,
+                        context,
+                        bytes::Bytes::copy_from_slice(&msg.identity.to_le_bytes()),
+                    )?;
+                }
                 Ok(batch)
             }
         });

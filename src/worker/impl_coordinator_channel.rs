@@ -236,11 +236,9 @@ impl Worker {
                                 ));
                                 break;
                             }
-                            if tx.sender.send(Ok(wu)).is_err() {
-                                // Channel closed, this sender needs to be dropped, as none will ever
-                                // be listening on the other side.
-                                work_unit_senders.remove(&(id, partition));
-                                continue;
+                            if let Err(error) = tx.send(wu) {
+                                let _ = dynamic_filters_error_tx.try_send(error);
+                                break;
                             }
                         }
                     }
@@ -272,7 +270,7 @@ impl Worker {
                             credit
                                 .lock()
                                 .map_err(|_| exec_datafusion_err!("Demand credit poisoned"))?
-                                .respond(demand)?;
+                                .respond(&demand, response.unit.is_some())?;
                             match response.unit {
                                 Some(unit) => {
                                     if unit.id != demand.id || unit.partition != demand.partition {
@@ -280,20 +278,7 @@ impl Worker {
                                             "Work unit response identity mismatch"
                                         ));
                                     }
-                                    let size = match &unit.body {
-                                        MaybeEncoded::Encoded(bytes) => bytes.capacity(),
-                                        MaybeEncoded::Decoded(value) => value.encoded_len(),
-                                    };
-                                    tx.memory.try_resize(
-                                        size.checked_mul(3)
-                                            .and_then(|size| size.checked_add(512))
-                                            .ok_or_else(|| {
-                                                exec_datafusion_err!("Descriptor size overflow")
-                                            })?,
-                                    )?;
-                                    tx.sender.send(Ok(unit)).map_err(|_| {
-                                        exec_datafusion_err!("Demand receiver closed")
-                                    })?;
+                                    tx.send(unit)?;
                                 }
                                 None => {
                                     senders.remove(&(demand.id, demand.partition));

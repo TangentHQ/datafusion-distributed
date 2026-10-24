@@ -139,11 +139,14 @@ pub struct WorkUnitMsg {
 
 /// Bound to the TaskKey of the coordinator channel carrying it. Sequences start
 /// at zero and advance once per response, so duplicates fail the query.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WorkUnitDemand {
     pub id: Uuid,
     pub partition: usize,
     pub sequence: u64,
+    /// Completion of the descriptor returned for sequence-1. The exact
+    /// task/feed/partition is implicit in this authenticated channel.
+    pub feedback: Option<bytes::Bytes>,
 }
 
 pub struct WorkUnitResponse {
