@@ -271,13 +271,20 @@ async fn _inject_network_boundaries(
     if required.len() != processed_children.len() {
         return plan_err!("Execution plan input distribution differs from its children");
     }
-    for (child, required) in processed_children.iter_mut().zip(required) {
+    for (index, (child, required)) in processed_children.iter_mut().zip(required).enumerate() {
         let count = nb_ctx.task_count(child)?;
         if count.as_usize() <= 1 {
             continue;
         }
         match required {
             Distribution::SinglePartition => {
+                // Broadcast already supplies a complete build replica to every
+                // consumer. Its local coalesce satisfies the join's native
+                // single-partition contract. Gathering across tasks here would
+                // collect every replica and multiply matching rows.
+                if index == 0 && replicated_build(&plan, child) {
+                    continue;
+                }
                 *child = gather(Arc::clone(child), nb_ctx).await?;
             }
             Distribution::UnspecifiedDistribution => {}
@@ -438,6 +445,23 @@ async fn _inject_network_boundaries(
         // to do anything else.
         Ok(nb_ctx.plan_with_task_count(plan, task_count))
     }
+}
+
+fn replicated_build(plan: &Arc<dyn ExecutionPlan>, child: &Arc<dyn ExecutionPlan>) -> bool {
+    let safe = if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+        join.mode == PartitionMode::CollectLeft
+            && !join.null_aware
+            && is_left_broadcast_safe(join.join_type())
+    } else if let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() {
+        is_left_broadcast_safe(join.join_type())
+    } else {
+        plan.is::<CrossJoinExec>()
+    };
+    safe && child
+        .downcast_ref::<CoalescePartitionsExec>()
+        .is_some_and(|coalesce| {
+            coalesce.fetch().is_none() && coalesce.input().is::<NetworkBroadcastExec>()
+        })
 }
 
 enum Boundary {
