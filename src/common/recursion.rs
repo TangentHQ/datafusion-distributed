@@ -1,4 +1,4 @@
-use crate::execution_plans::ChildrenIsolatorUnionExec;
+use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
 use crate::{DistributedTaskContext, NetworkBoundaryExt};
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeIterator, TreeNodeRecursion};
@@ -185,6 +185,9 @@ impl TreeNodeExt for Arc<dyn ExecutionPlan> {
             ctx: DistributedTaskContext,
             f: &mut F,
         ) -> Result<TreeNodeRecursion> {
+            if let Some(leaf) = plan.downcast_ref::<DistributedLeafExec>() {
+                return recurse(&leaf.to_task_specialized(ctx.task_index), ctx, f);
+            }
             f(plan, ctx)?.visit_children(|| {
                 if let Some(ciu) = plan.downcast_ref::<ChildrenIsolatorUnionExec>() {
                     // Just recurse to children that will actually get executed by this

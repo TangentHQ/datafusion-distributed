@@ -491,6 +491,10 @@ impl<'a> StageCoordinator<'a> {
 
         let plan = Arc::clone(self.plan);
         let transformed = plan.transform_down_with_dt_ctx(d_ctx, |plan, d_ctx| {
+            let (plan, specialized) = match plan.downcast_ref::<DistributedLeafExec>() {
+                Some(leaf) => (leaf.to_task_specialized(d_ctx.task_index), true),
+                None => (plan, false),
+            };
             if let Some(wuf) = wuf_registry.get_work_unit_feed(&plan) {
                 work_unit_feed_declarations.push(WorkUnitFeedDeclaration {
                     id: wuf.id(),
@@ -541,11 +545,6 @@ impl<'a> StageCoordinator<'a> {
                 return Ok(Transformed::yes(Arc::new(ciu)));
             };
 
-            if let Some(dle) = plan.downcast_ref::<DistributedLeafExec>() {
-                let specialized = dle.to_task_specialized(d_ctx.task_index);
-                return Ok(Transformed::yes(specialized));
-            }
-
             // Rebuild each RepartitionExec so every task gets its own instance with
             // fresh partition state; sharing one across tasks causes a "partition not
             // used yet" panic when the second task tries to pull from it.
@@ -558,7 +557,11 @@ impl<'a> StageCoordinator<'a> {
                 return Ok(Transformed::yes(local_repartion_exec));
             }
             // we are explicitly not retransforming the entire plan. if other operators cause shared state errors they will error out.
-            Ok(Transformed::no(plan))
+            Ok(Transformed {
+                data: plan,
+                transformed: specialized,
+                tnr: TreeNodeRecursion::Continue,
+            })
         })?;
         let plan = if dynamic_filtering_enabled {
             maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
@@ -703,5 +706,147 @@ mod tests {
                  — rustc metric-builder miscompilation (use a named fn, not a closure)"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "integration"))]
+mod feed_tests {
+    use super::*;
+    use crate::test_utils::test_work_unit_feed::{
+        RowGeneratorExec, RowGeneratorFeedProvider, RowGeneratorWorkUnit, TestWorkUnitFeedExecCodec,
+    };
+    use crate::{DistributedExt, WorkUnitDemand, WorkUnitFeed};
+    use datafusion::execution::SessionStateBuilder;
+    use prost::Message;
+
+    // Selected DLE variants are opaque leaves. Both declaration and eager
+    // enumeration must visit that actual variant, before protobuf conversion.
+    #[tokio::test]
+    async fn scaled_leaf_feeds_are_declared_and_delivered_in_both_modes() -> Result<()> {
+        for demand in [false, true] {
+            let provider = RowGeneratorFeedProvider::shared(2, 1..=4);
+            let feed = WorkUnitFeed::new(provider);
+            let feed = if demand { feed.with_demand() } else { feed };
+            let leaf = Arc::new(RowGeneratorExec::new(
+                feed.clone(),
+                "selected".into(),
+                1,
+                None,
+                4,
+            )) as Arc<dyn ExecutionPlan>;
+            let plan = Arc::new(DistributedLeafExec::try_new(
+                leaf.clone(),
+                [leaf.clone(), leaf.clone()],
+            )?) as Arc<dyn ExecutionPlan>;
+            let ctx = SessionStateBuilder::new()
+                .with_default_features()
+                .with_distributed_option_extension(crate::DistributedConfig::default())
+                .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+                .with_distributed_work_unit_feed(|scan: &RowGeneratorExec| Some(&scan.feed))
+                .build()
+                .task_ctx();
+            let mut output = RecordBatchReceiverStreamBuilder::new(plan.schema(), 2);
+            let coordinator = QueryCoordinator::new(
+                ctx,
+                &ExecutionPlanMetricsSet::new(),
+                None,
+                None,
+                &mut output,
+            );
+            let mut ids = vec![];
+            for task in 0..2usize {
+                let stage = LocalStage {
+                    query_id: Uuid::new_v4(),
+                    num: 1,
+                    plan: plan.clone(),
+                    tasks: 2,
+                    metrics_set: Default::default(),
+                };
+                let mut channel = coordinator.stage_coordinator(&stage);
+                let specialized = channel.task_specialized_plan(task)?;
+                assert_eq!(
+                    specialized.work_unit_feed_declarations.len(),
+                    1,
+                    "a scaled leaf lost its feed authority"
+                );
+                let declaration = &specialized.work_unit_feed_declarations[0];
+                let id = declaration.id;
+                let (tx, mut rx) = unbounded_channel();
+                if demand {
+                    let key = TaskKey {
+                        query_id: stage.query_id,
+                        stage_id: 1,
+                        task_number: task,
+                    };
+                    coordinator.demands.sender(key, tx)?;
+                    for sequence in 0..6 {
+                        coordinator
+                            .demands
+                            .request(
+                                key,
+                                WorkUnitDemand {
+                                    id,
+                                    partition: 0,
+                                    sequence,
+                                    feedback: None,
+                                },
+                            )?
+                            .await?;
+                        let Some(CoordinatorToWorkerMsg::WorkUnitResponse(response)) =
+                            rx.recv().await
+                        else {
+                            panic!("missing demand response");
+                        };
+                        let Some(unit) = response.unit else {
+                            break;
+                        };
+                        let bytes = match unit.body {
+                            MaybeEncoded::Decoded(value) => value.encode_to_bytes(),
+                            MaybeEncoded::Encoded(bytes) => bytes,
+                        };
+                        ids.push(
+                            RowGeneratorWorkUnit::decode(bytes.as_slice())
+                                .map_err(|error| DataFusionError::External(Box::new(error)))?
+                                .identity,
+                        );
+                    }
+                } else {
+                    channel.coordinator_to_worker_task(task, tx)?;
+                    loop {
+                        match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                            .await
+                            .expect("scaled feed deadlocked")
+                        {
+                            Some(CoordinatorToWorkerMsg::WorkUnitBatch(batch)) => {
+                                for unit in batch.batch {
+                                    let bytes = match unit.body {
+                                        MaybeEncoded::Decoded(value) => value.encode_to_bytes(),
+                                        MaybeEncoded::Encoded(bytes) => bytes,
+                                    };
+                                    ids.push(
+                                        RowGeneratorWorkUnit::decode(bytes.as_slice())
+                                            .map_err(|error| {
+                                                DataFusionError::External(Box::new(error))
+                                            })?
+                                            .identity,
+                                    );
+                                }
+                            }
+                            Some(CoordinatorToWorkerMsg::WorkUnitEos) => break,
+                            _ => panic!("missing eager feed completion"),
+                        }
+                    }
+                }
+            }
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec![1, 2, 3, 4],
+                "selected tasks must consume every frozen descriptor once"
+            );
+            drop(coordinator);
+            drop(output);
+        }
+        Ok(())
     }
 }
