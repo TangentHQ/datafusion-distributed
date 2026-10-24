@@ -25,6 +25,44 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use futures::future::BoxFuture;
 use std::sync::Arc;
 
+/// Upper bound for simultaneous HTTP/2 streams from one member to a peer.
+/// Call this on the prepared dynamic physical plan, before execution. `resident`
+/// is the maximum tasks of *each* stage routed to one member; callers must
+/// disable route failover or include its placement skew in that bound.
+///
+/// Boundary injection creates at most one stage per shaped node, one per
+/// input edge for an otherwise elided native distribution, and a final root
+/// gather. AQE changes task counts, not this shaped operator inventory. Each
+/// resident producer/consumer pair opens one ExecuteTask request: Direct
+/// and Broadcast batch all of that consumer task's partitions in one range;
+/// TwoPhase uses one range per producer task. WorkerConnectionPool caches
+/// those exact ranges. Control streams remain live across the entire DAG.
+/// This bounds channel metadata, not protobuf body allocation.
+pub fn peer_streams(
+    plan: &Arc<dyn ExecutionPlan>,
+    resident: usize,
+) -> datafusion::common::Result<u32> {
+    use datafusion::common::{plan_datafusion_err, tree_node::TreeNodeRecursion};
+    if resident == 0 {
+        return datafusion::common::plan_err!("Distributed member has no admitted task slots");
+    }
+    let overflow = || plan_datafusion_err!("Distributed channel envelope overflow");
+    let mut stages = 1usize;
+    plan.apply(|plan| {
+        stages = stages
+            .checked_add(1 + plan.children().len())
+            .ok_or_else(overflow)?;
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let streams = resident
+        .checked_mul(resident)
+        .and_then(|data| data.checked_add(resident))
+        .and_then(|per_stage| per_stage.checked_mul(stages))
+        .and_then(|all| all.checked_add(2))
+        .ok_or_else(overflow)?;
+    u32::try_from(streams).map_err(|_| overflow())
+}
+
 /// Transforms a single-node physical plan into a distributed plan by injecting network
 /// boundaries between stages.
 ///
@@ -1122,9 +1160,11 @@ mod single_partition_tests {
                 },
             );
             let mut config = SessionConfig::new().with_target_partitions(1);
-            let mut distributed = DistributedConfig::default();
-            distributed.dynamic_task_count = dynamic;
-            distributed.max_tasks_per_stage = 2;
+            let distributed = DistributedConfig {
+                dynamic_task_count: dynamic,
+                max_tasks_per_stage: 2,
+                ..Default::default()
+            };
             config.set_distributed_option_extension(distributed);
             let state = SessionStateBuilder::new()
                 .with_default_features()
@@ -1205,6 +1245,249 @@ mod single_partition_tests {
             format!(
                 "command: cargo +1.97.1 test --offline --no-default-features --lib scaled_single_partition_queries_match_native_sql\ninputs: nativePartitions=1 desiredTasks=2 sourceRows=8\nexpected: every task contributes once; sorted, limited, grouped and windowed results equal independent native SQL\nobserved: dynamic\trows\tsql\n{}\n",
                 observed.join("\n")
+            ),
+        )?;
+        Ok(())
+    }
+    /// All branch setup channels remain open until the query ends. The old
+    /// per-partition cap deadlocks before the final branches can be prepared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn whole_dag_peer_capacity_prepares_every_branch_and_cancels_cleanly() -> Result<()> {
+        use crate::test_utils::test_work_unit_feed::ScanGate;
+        use crate::{ChannelResolver, Worker, WorkerChannel, WorkerResolver, grpc};
+        use datafusion::common::runtime::SpawnedTask;
+        use datafusion::execution::{
+            memory_pool::{GreedyMemoryPool, MemoryPool},
+            runtime_env::RuntimeEnvBuilder,
+        };
+        use datafusion::physical_plan::{common::collect, execute_stream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone)]
+        struct Http {
+            url: url::Url,
+            channel: tonic::transport::Channel,
+        }
+        impl WorkerResolver for Http {
+            fn get_urls(&self) -> Result<Vec<url::Url>> {
+                Ok(vec![self.url.clone()])
+            }
+        }
+        #[async_trait::async_trait]
+        impl ChannelResolver for Http {
+            async fn get_worker_client_for_url(
+                &self,
+                url: &url::Url,
+            ) -> Result<Box<dyn WorkerChannel>> {
+                assert_eq!(url, &self.url);
+                Ok(grpc::create_worker_client_with_limit(
+                    grpc::BoxCloneSyncChannel::new(self.channel.clone()),
+                    2 * 1024 * 1024,
+                ))
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = url::Url::parse(&format!("http://{}", listener.local_addr()?)).unwrap();
+        let http = Http {
+            channel: tonic::transport::Channel::from_shared(url.to_string())
+                .unwrap()
+                .connect_lazy(),
+            url,
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let runtime = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(pool.clone())
+                .build()?,
+        );
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(ScanGate {
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let setups = Arc::new(AtomicUsize::new(0));
+        let (changed, mut setup_changes) = tokio::sync::watch::channel(0usize);
+        let worker = Worker::from_session_builder({
+            let gate = gate.clone();
+            let http = http.clone();
+            let setups = setups.clone();
+            move |ctx: WorkerQueryContext| {
+                let gate = gate.clone();
+                let http = http.clone();
+                let setups = setups.clone();
+                let changed = changed.clone();
+                async move {
+                    let mut builder = ctx.builder;
+                    let config = builder.config().as_mut().unwrap();
+                    *config = config.clone().with_extension(gate);
+                    let state = builder
+                        .with_distributed_channel_resolver(http)
+                        .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+                        .with_distributed_work_unit_feed(|leaf: &RowGeneratorExec| Some(&leaf.feed))
+                        .build();
+                    let count = setups.fetch_add(1, Ordering::SeqCst) + 1;
+                    changed.send_replace(count);
+                    Ok(state)
+                }
+            }
+        })
+        .with_runtime_env(runtime.clone());
+        let mut config = SessionConfig::new().with_target_partitions(2);
+        let distributed = DistributedConfig {
+            dynamic_task_count: true,
+            max_tasks_per_stage: 2,
+            max_coordinator_channel_retries: 0,
+            ..Default::default()
+        };
+        config.set_distributed_option_extension(distributed);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_runtime_env(runtime.clone())
+            .with_config(config)
+            .with_distributed_channel_resolver(http.clone())
+            .with_distributed_worker_resolver(http.clone())
+            .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+            .with_distributed_work_unit_feed(|leaf: &RowGeneratorExec| Some(&leaf.feed))
+            .with_distributed_desired_task_count_handler(row_generator_desired_task_count_handler)
+            .with_distributed_scale_up_leaf_node_handler(row_generator_scale_up_leaf_node_handler)
+            .with_distributed_planner()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let input = || {
+            Arc::new(Input(Arc::new(RowGeneratorExec::new(
+                crate::WorkUnitFeed::new(RowGeneratorFeedProvider::shared(2, 1..=64)).with_demand(),
+                "input".into(),
+                1,
+                None,
+                64,
+            )))) as Arc<dyn TableProvider>
+        };
+        ctx.register_table("input", input())?;
+        let sql = format!(
+            "SELECT SUM(n) AS total FROM ({})",
+            (0..8)
+                .map(|_| "SELECT SUM(CASE WHEN task >= 0 THEN 1 ELSE 0 END) AS n FROM input")
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ")
+        );
+        let physical = ctx.sql(&sql).await?.create_physical_plan().await?;
+        let streams = super::peer_streams(&physical, 2)?;
+        assert!(
+            starts.try_recv().is_err(),
+            "physical planning must not read input"
+        );
+        let stop = tokio_util::sync::CancellationToken::new();
+        let stopping = stop.clone();
+        let service = worker
+            .clone()
+            .into_worker_server()
+            .max_decoding_message_size(2 * 1024 * 1024)
+            .max_encoding_message_size(2 * 1024 * 1024);
+        let server = SpawnedTask::spawn(async move {
+            tonic::transport::Server::builder()
+                .max_concurrent_streams(Some(streams))
+                .add_service(service)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    stopping.cancelled_owned(),
+                )
+                .await
+        });
+        let task_ctx = ctx.task_ctx();
+        let mut query =
+            SpawnedTask::spawn(async move { collect(execute_stream(physical, task_ctx)?).await });
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while setups.load(Ordering::SeqCst) < 16 {
+                setup_changes.changed().await.unwrap();
+            }
+            while starts.recv().await.unwrap().1 != 1 {}
+        })
+        .await
+        .expect("whole DAG setup exhausted HTTP/2 streams");
+        assert!(
+            futures::poll!(&mut query).is_pending(),
+            "the required input is still held at its barrier"
+        );
+        gate.release.add_permits(1);
+        let actual = tokio::time::timeout(std::time::Duration::from_secs(20), &mut query)
+            .await
+            .unwrap()
+            .unwrap()?;
+        let native = SessionContext::new();
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from_iter_values(0..64)) as datafusion::arrow::array::ArrayRef,
+        )])?;
+        native.register_table(
+            "input",
+            Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?),
+        )?;
+        let expected = native
+            .sql("SELECT COUNT(*) AS total FROM input")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            pretty_format_batches(&actual)?.to_string(),
+            pretty_format_batches(&expected)?.to_string()
+        );
+        drop(actual);
+        drop(expected);
+        drop(native);
+        let first_setups = setups.load(Ordering::SeqCst);
+        ctx.deregister_table("input")?;
+        ctx.register_table("input", input())?;
+        let physical = ctx.sql(&sql).await?.create_physical_plan().await?;
+        let task_ctx = ctx.task_ctx();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancelling = cancel.clone();
+        let query = SpawnedTask::spawn(async move {
+            let stream = execute_stream(physical, task_ctx)?;
+            tokio::select! {
+                () = cancelling.cancelled() => Ok(Vec::new()),
+                result = collect(stream) => result,
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while setups.load(Ordering::SeqCst) < first_setups + 16 {
+                setup_changes.changed().await.unwrap();
+            }
+            while starts.recv().await.unwrap().1 != 1 {}
+        })
+        .await
+        .expect("second DAG setup blocked");
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), query)
+            .await
+            .unwrap()
+            .unwrap()?;
+        drop(ctx);
+        drop(http);
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker.shutdown())
+            .await
+            .unwrap();
+        drop(worker);
+        stop.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(runtime);
+        drop(gate);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "EOF and cancellation release every stage/Flight/sampler owner"
+        );
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/replays/whole-dag.tsv");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(
+            path,
+            format!(
+                "command: cargo +1.97.1 test --offline --lib whole_dag_peer_capacity\ninput: 8 COUNT branches, 2 tasks, one TCP/H2 peer, ID1 barrier\nexpected: all branches prepare before release; native SQL total64; cancellation joins while ID1 remains held; final pool0\nobserved: streamEnvelope={streams} setups={} finalReserved={}\n",
+                setups.load(Ordering::SeqCst),
+                pool.reserved()
             ),
         )?;
         Ok(())

@@ -12,6 +12,7 @@ mod session_state_builder_ext;
 mod statistics;
 
 pub use distributed_config::DistributedConfig;
+pub use distributed_query_planner::peer_streams;
 pub(crate) use inject_network_boundaries::{
     InjectNetworkBoundaryContext, NetworkBoundaryBuilderResult, inject_network_boundaries,
 };
