@@ -1041,3 +1041,172 @@ mod tests {
         ");
     }
 }
+
+#[cfg(test)]
+mod single_partition_tests {
+    use crate::test_utils::{
+        in_memory_channel_resolver::{InMemoryChannelResolver, InMemoryWorkerResolver},
+        test_work_unit_feed::{
+            RowGeneratorExec, RowGeneratorFeedProvider, TestWorkUnitFeedExecCodec, WorkUnitOp,
+            row_generator_desired_task_count_handler, row_generator_scale_up_leaf_node_handler,
+        },
+    };
+    use crate::{DistributedConfig, DistributedExt, SessionStateBuilderExt, WorkerQueryContext};
+    use datafusion::{
+        arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::SchemaRef,
+            record_batch::RecordBatch,
+            util::pretty::pretty_format_batches,
+        },
+        catalog::{Session, TableProvider},
+        common::Result,
+        datasource::{MemTable, TableType},
+        execution::SessionStateBuilder,
+        logical_expr::Expr,
+        physical_expr::expressions::Column,
+        physical_plan::{ExecutionPlan, projection::ProjectionExec},
+        prelude::{SessionConfig, SessionContext},
+    };
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct Input(Arc<dyn ExecutionPlan>);
+    #[async_trait::async_trait]
+    impl TableProvider for Input {
+        fn schema(&self) -> SchemaRef {
+            self.0.schema()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            _: &[Expr],
+            _: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            match projection {
+                None => Ok(self.0.clone()),
+                Some(indices) => Ok(Arc::new(ProjectionExec::try_new(
+                    indices
+                        .iter()
+                        .map(|&index| {
+                            (
+                                Arc::new(Column::new(self.0.schema().field(index).name(), index))
+                                    as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                                self.0.schema().field(index).name().clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    self.0.clone(),
+                )?)),
+            }
+        }
+    }
+    /// A native one-partition plan may legitimately omit coalesces and hash
+    /// repartitions. Scaling its leaf must restore those semantic boundaries,
+    /// and the result collector must consume every task rather than variant0.
+    #[tokio::test]
+    async fn scaled_single_partition_queries_match_native_sql() -> Result<()> {
+        let mut observed = Vec::new();
+        for dynamic in [false, true] {
+            let channels = InMemoryChannelResolver::from_session_builder(
+                |ctx: WorkerQueryContext| async move {
+                    Ok(ctx
+                        .builder
+                        .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+                        .with_distributed_work_unit_feed(|leaf: &RowGeneratorExec| Some(&leaf.feed))
+                        .build())
+                },
+            );
+            let mut config = SessionConfig::new().with_target_partitions(1);
+            let mut distributed = DistributedConfig::default();
+            distributed.dynamic_task_count = dynamic;
+            distributed.max_tasks_per_stage = 2;
+            config.set_distributed_option_extension(distributed);
+            let state = SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(config)
+                .with_distributed_channel_resolver(channels)
+                .with_distributed_worker_resolver(InMemoryWorkerResolver::new(2))
+                .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+                .with_distributed_work_unit_feed(|leaf: &RowGeneratorExec| Some(&leaf.feed))
+                .with_distributed_desired_task_count_handler(
+                    row_generator_desired_task_count_handler,
+                )
+                .with_distributed_scale_up_leaf_node_handler(
+                    row_generator_scale_up_leaf_node_handler,
+                )
+                .with_distributed_planner()
+                .build();
+            let ctx = SessionContext::new_with_state(state);
+            let provider = RowGeneratorFeedProvider::new(
+                2,
+                vec![vec![WorkUnitOp::Rows(4)], vec![WorkUnitOp::Rows(4)]],
+            );
+            let leaf = Arc::new(RowGeneratorExec::new(
+                crate::WorkUnitFeed::new(provider),
+                "input".into(),
+                1,
+                None,
+                8,
+            )) as Arc<dyn ExecutionPlan>;
+            ctx.register_table("input", Arc::new(Input(leaf.clone())))?;
+            let batch = RecordBatch::try_new(
+                leaf.schema(),
+                vec![
+                    Arc::new(StringArray::from(vec!["input"; 8])),
+                    Arc::new(Int64Array::from(vec![0, 0, 0, 0, 1, 1, 1, 1])),
+                    Arc::new(Int64Array::from(vec![0; 8])),
+                    Arc::new(StringArray::from(vec![
+                        "a", "b", "c", "d", "a", "b", "c", "d",
+                    ])),
+                ],
+            )?;
+            let native =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            native.register_table(
+                "input",
+                Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?),
+            )?;
+            for sql in [
+                "SELECT task,letter FROM input ORDER BY task,letter",
+                "SELECT COUNT(DISTINCT task) AS c FROM input",
+                "SELECT task FROM input ORDER BY task DESC LIMIT 3",
+                "SELECT letter,COUNT(*) AS c FROM input GROUP BY letter ORDER BY letter",
+                "SELECT ROW_NUMBER() OVER (ORDER BY task,letter) AS n FROM input ORDER BY n",
+                "SELECT letter,COUNT(*) OVER (PARTITION BY letter) AS n FROM input ORDER BY letter,n",
+            ] {
+                let actual = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    ctx.sql(sql).await?.collect(),
+                )
+                .await
+                .expect("single-partition query deadlocked")?;
+                let expected = native.sql(sql).await?.collect().await?;
+                assert_eq!(
+                    pretty_format_batches(&actual)?.to_string(),
+                    pretty_format_batches(&expected)?.to_string(),
+                    "dynamic={dynamic}; {sql}"
+                );
+                observed.push(format!(
+                    "{dynamic}\t{}\t{sql}",
+                    actual.iter().map(|batch| batch.num_rows()).sum::<usize>()
+                ));
+            }
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/replays/single-partition.tsv");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(
+            path,
+            format!(
+                "command: cargo +1.97.1 test --offline --no-default-features --lib scaled_single_partition_queries_match_native_sql\ninputs: nativePartitions=1 desiredTasks=2 sourceRows=8\nexpected: every task contributes once; sorted, limited, grouped and windowed results equal independent native SQL\nobserved: dynamic\trows\tsql\n{}\n",
+                observed.join("\n")
+            ),
+        )?;
+        Ok(())
+    }
+}

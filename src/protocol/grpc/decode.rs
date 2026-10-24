@@ -12,12 +12,16 @@ use datafusion::{
     common::{DataFusionError, Result, exec_datafusion_err},
     execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
+
+// Arrow IPC accepts its concrete standard-library dictionary table.
+#[allow(clippy::disallowed_types)]
+type Dictionaries = std::collections::HashMap<i64, ArrayRef>;
 
 pub(super) struct Decoder {
     pool: Arc<dyn MemoryPool>,
     schema: Option<SchemaRef>,
-    dictionaries: HashMap<i64, ArrayRef>,
+    dictionaries: Dictionaries,
     metadata: Arc<MemoryReservation>,
 }
 impl Decoder {
@@ -26,7 +30,7 @@ impl Decoder {
             metadata: Arc::new(MemoryConsumer::new("FlightSchema").register(&pool)),
             pool,
             schema: None,
-            dictionaries: HashMap::new(),
+            dictionaries: Dictionaries::new(),
         }
     }
     pub(super) fn decode(

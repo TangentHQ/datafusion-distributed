@@ -65,10 +65,10 @@ pub(super) fn encode(
     let mut stream = stream;
     let input = futures::stream::poll_fn(move |cx| {
         let next = std::task::ready!(stream.as_mut().poll_next(cx));
-        if next.is_none() {
-            if let Ok(mut memory) = completed.lock() {
-                memory.take();
-            }
+        if next.is_none()
+            && let Ok(mut memory) = completed.lock()
+        {
+            memory.take();
         }
         std::task::Poll::Ready(next)
     });
