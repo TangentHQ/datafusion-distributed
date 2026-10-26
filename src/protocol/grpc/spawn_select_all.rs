@@ -3,6 +3,7 @@ use arrow_flight::{FlightData, error::FlightError};
 use datafusion::common::runtime::SpawnedTask;
 
 use futures::{Stream, StreamExt};
+use std::{future::Future, task::Poll};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -52,9 +53,29 @@ where
             }
         })));
     }
-    futures::stream::select_all(receivers).map(move |message| {
-        let _ = &tasks;
-        message
+    let mut output = futures::stream::select_all(receivers);
+    let mut cancel = Box::pin(closed.cancelled_owned());
+    let mut done = false;
+    futures::stream::poll_fn(move |cx| {
+        if done {
+            return Poll::Ready(None);
+        }
+        if cancel.as_mut().poll(cx).is_ready() {
+            done = true;
+            output.clear();
+            tasks.clear();
+            return Poll::Ready(Some(Err(FlightError::Tonic(Box::new(
+                tonic::Status::unavailable("Worker is shut down"),
+            )))));
+        }
+        match output.poll_next_unpin(cx) {
+            Poll::Ready(None) => {
+                done = true;
+                tasks.clear();
+                Poll::Ready(None)
+            }
+            message => message,
+        }
     })
 }
 
@@ -99,7 +120,7 @@ mod tests {
             if mode == 2 {
                 assert!(futures::poll!(&mut shutdown).is_pending());
             }
-            let stream = spawn_select_all(
+            let mut stream = spawn_select_all(
                 vec![input],
                 1,
                 producer.tracker.clone(),
@@ -114,6 +135,11 @@ mod tests {
                 .expect("worker shutdown must join its Flight producers");
             assert_eq!(pool.reserved(), 0, "mode: {mode}");
             assert!(worker.producer().await.is_err());
+            assert!(matches!(
+                stream.next().await,
+                Some(Err(FlightError::Tonic(status))) if status.code() == tonic::Code::Unavailable
+            ));
+            assert!(stream.next().await.is_none());
             drop(stream);
         }
     }
@@ -134,8 +160,10 @@ mod tests {
         let data = stream.next().await.unwrap().unwrap();
         let child = data.data_body.slice(1..4);
         drop(data);
-        drop(stream);
+        assert!(stream.next().await.is_none());
         worker.shutdown().await;
+        assert!(stream.next().await.is_none());
+        drop(stream);
         assert_eq!(pool.reserved(), 7);
         assert_eq!(child.as_ref(), b"ayl");
         drop(child);
