@@ -147,6 +147,13 @@ impl pb::worker_service_server::WorkerService for Worker {
             .await
             .map_err(datafusion_error_to_tonic_status)?;
 
+        // The task may have opened just before shutdown began. Fence producer
+        // registration separately, keeping admission through spawning all pumps.
+        let producer = self
+            .producer()
+            .await
+            .map_err(datafusion_error_to_tonic_status)?;
+
         let d_cfg = DistributedConfig::from_config_options(task_ctx.session_config().options())
             .map_err(datafusion_error_to_tonic_status)?;
 
@@ -183,7 +190,12 @@ impl pb::worker_service_server::WorkerService for Worker {
 
         // Merge all the per-partition streams into one. Each message in the stream is marked with
         // the original partition, so they can be reconstructed at the other side of the boundary.
-        let stream = spawn_select_all(flight_streams, RECORD_BATCH_BUFFER_SIZE);
+        let stream = spawn_select_all(
+            flight_streams,
+            RECORD_BATCH_BUFFER_SIZE,
+            producer.tracker.clone(),
+            producer.closed.clone(),
+        );
 
         Ok(Response::new(Box::pin(stream.map_err(|err| match err {
             FlightError::Tonic(status) => *status,

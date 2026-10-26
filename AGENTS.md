@@ -88,6 +88,8 @@ Read the relevant contributor guide before starting work in these areas:
 
 ## Validation
 
+Worker shutdown must fence Flight producer registration and join producer futures, including those blocked on input or queue capacity. Returned Flight byte slices retain their reservations independently until their last owner drops.
+
 Run the narrowest relevant check first. Use the repository's standard format,
 lint, test, and documentation commands as appropriate; the contributor guide
 documents the full validation matrix.
