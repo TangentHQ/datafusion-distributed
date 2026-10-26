@@ -2,6 +2,8 @@ use crate::protocol::LocalWorkerContext;
 use crate::worker::{SingleWriteMultiRead, WorkerSessionBuilder};
 use crate::{DefaultSessionBuilder, TaskData, TaskKey};
 use datafusion::common::DataFusionError;
+#[cfg(feature = "grpc")]
+use datafusion::common::{Result, exec_err};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use moka::future::Cache;
 use std::borrow::Cow;
@@ -9,6 +11,10 @@ use std::sync::Arc;
 #[cfg(feature = "integration")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+#[cfg(feature = "grpc")]
+use tokio::sync::RwLockReadGuard;
+#[cfg(feature = "grpc")]
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use url::Url;
 
 const TASK_CACHE_TTI: Duration = Duration::from_mins(10);
@@ -33,6 +39,14 @@ pub struct Worker {
     pub(super) coordinator_channels_running: Arc<AtomicUsize>,
 }
 
+/// Registration stays fenced until every producer owns a tracked future.
+#[cfg(feature = "grpc")]
+pub(crate) struct Producer<'a> {
+    _admission: RwLockReadGuard<'a, ()>,
+    pub(crate) tracker: TaskTracker,
+    pub(crate) closed: CancellationToken,
+}
+
 impl Default for Worker {
     fn default() -> Self {
         let cache = Cache::builder().time_to_idle(TASK_CACHE_TTI).build();
@@ -52,7 +66,20 @@ impl Default for Worker {
 }
 
 impl Worker {
-    /// End this worker's query scope and join its coordinator readers before
+    #[cfg(feature = "grpc")]
+    pub(crate) async fn producer(&self) -> Result<Producer<'_>> {
+        let admission = self.admission.read().await;
+        if self.closed.is_cancelled() {
+            return exec_err!("Worker is shut down");
+        }
+        Ok(Producer {
+            _admission: admission,
+            tracker: self.readers.clone(),
+            closed: self.closed.clone(),
+        })
+    }
+
+    /// End this worker's query scope and join its readers and Flight producers before
     /// releasing VM resources. Existing output arrays keep their own charges.
     /// This is cancellation and cleanup, never a task retry or reassignment.
     pub async fn shutdown(&self) {
