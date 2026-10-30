@@ -8,6 +8,7 @@ use arrow_flight::{
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
 use datafusion::{
+    arrow::array::{AsArray, RecordBatch},
     common::{Result, exec_datafusion_err},
     execution::{
         SendableRecordBatchStream,
@@ -75,8 +76,8 @@ pub(super) fn encode(
     let batches = input
         .and_then(move |batch| {
             let result = (|| {
-                // Includes native compaction, IPC padding, compressed output and
-                // vector growth. No view or dictionary GC may expand beyond it.
+                // Compaction and IPC encoding have separate pre-admitted
+                // lifetimes. Retained buffers keep their own reservation.
                 // Native Flight requests the next source batch only after all
                 // fragments of its previous batch have left its internal queue.
                 source
@@ -84,11 +85,30 @@ pub(super) fn encode(
                     .map_err(|_| exec_datafusion_err!("Flight encoding owner is poisoned"))?
                     .take();
                 let memory = Arc::new(MemoryConsumer::new("FlightEncodeBatch").register(&pool));
-                memory.try_grow(
-                    schema_bytes(&batch.schema())
-                        .saturating_mul(8)
-                        .saturating_add(65536),
-                )?;
+                // Compaction must be admitted before the native fragmenter is
+                // sized. Sparse views can retain backing from a whole input;
+                // multiplying that discarded backing by every fragment can
+                // reject a small live payload with a multi-gigabyte allowance.
+                let compact = compaction(&batch)?;
+                memory.try_resize(compact)?;
+                let prior = batch.clone();
+                let batch = super::worker_service::garbage_collect_arrays(batch)?;
+                let bytes = allocation_bytes(&batch, |start, length| {
+                    prior
+                        .columns()
+                        .iter()
+                        .any(|column| super::decode::contains(&column.to_data(), start, length))
+                });
+                // Arrow's dictionary tracker may keep compacted values after
+                // encoding. Their charge follows the actual child buffers.
+                if bytes > memory.size() {
+                    return Err(exec_datafusion_err!(
+                        "Flight compaction exceeds its admitted allowance"
+                    ));
+                }
+                let retained = memory.split(bytes);
+                drop(prior);
+                let batch = hold_batch(batch, retained)?;
                 let payload = batch.columns().iter().try_fold(0usize, |bytes, column| {
                     bytes
                         .checked_add(column.get_buffer_memory_size())
@@ -119,23 +139,6 @@ pub(super) fn encode(
                     .and_then(|bytes| bytes.checked_add(65536))
                     .ok_or_else(|| exec_datafusion_err!("Flight encoding allowance overflow"))?;
                 memory.try_resize(bytes)?;
-                let prior = batch.clone();
-                let batch = super::worker_service::garbage_collect_arrays(batch)?;
-                let bytes = allocation_bytes(&batch, |start, length| {
-                    prior
-                        .columns()
-                        .iter()
-                        .any(|column| super::decode::contains(&column.to_data(), start, length))
-                });
-                // Arrow's dictionary tracker may keep compacted values after
-                // encoding. Their charge follows the actual child buffers.
-                if bytes > memory.size() {
-                    return Err(exec_datafusion_err!(
-                        "Flight compaction exceeds its admitted allowance"
-                    ));
-                }
-                let retained = memory.split(bytes);
-                let batch = hold_batch(batch, retained)?;
                 *source
                     .lock()
                     .map_err(|_| exec_datafusion_err!("Flight encoding owner is poisoned"))? =
@@ -183,6 +186,41 @@ pub(super) fn encode(
         .boxed())
 }
 
+// Bound the native collector's new allocations before it runs. The collector
+// only copies a top-level view when its live bytes are smaller than its backing;
+// all other columns retain the existing conservative physical-size bound.
+fn compaction(batch: &RecordBatch) -> Result<usize> {
+    let payload = batch.columns().iter().try_fold(0usize, |bytes, column| {
+        let live = column
+            .as_string_view_opt()
+            .map(|view| view.total_buffer_bytes_used())
+            .or_else(|| {
+                column
+                    .as_binary_view_opt()
+                    .map(|view| view.total_buffer_bytes_used())
+            });
+        let size = if let Some(live) = live.filter(|live| *live < column.get_buffer_memory_size()) {
+            live.checked_add(
+                column
+                    .len()
+                    .checked_mul(16)
+                    .ok_or_else(|| exec_datafusion_err!("Flight compaction size overflow"))?,
+            )
+            .ok_or_else(|| exec_datafusion_err!("Flight compaction size overflow"))?
+        } else {
+            column.get_buffer_memory_size()
+        };
+        bytes
+            .checked_add(size)
+            .ok_or_else(|| exec_datafusion_err!("Flight compaction size overflow"))
+    })?;
+    payload
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(schema_bytes(&batch.schema()).checked_mul(8)?))
+        .and_then(|bytes| bytes.checked_add(65536))
+        .ok_or_else(|| exec_datafusion_err!("Flight compaction allowance overflow"))
+}
+
 // Native Flight slices retain a view array's variadic buffers. Each fragment
 // can encode that backing allocation again, even if all its rows share one
 // long value. Account for this before the native encoder queues fragments.
@@ -219,6 +257,91 @@ mod tests {
         execution::memory_pool::GreedyMemoryPool,
         physical_plan::stream::RecordBatchStreamAdapter,
     };
+
+    #[tokio::test]
+    async fn sparse_views_roundtrip_with_a_budget_for_live_values() {
+        use arrow_flight::decode::FlightRecordBatchStream;
+        use datafusion::arrow::array::{Array, StringViewArray};
+
+        for compression in [None, Some(CompressionType::ZSTD)] {
+            for padding in [1024 * 1024, 8 * 1024 * 1024] {
+                let values = (0..4096)
+                    .map(|index| {
+                        (index % 7 != 0)
+                            .then(|| format!("company-{index:06}-official-registry-value"))
+                    })
+                    .collect::<Vec<_>>();
+                let source = StringViewArray::from_iter(
+                    std::iter::once(Some("unused".repeat(padding / 6)))
+                        .chain(values.iter().cloned()),
+                );
+                let batch = RecordBatch::try_from_iter([
+                    (
+                        "company",
+                        Arc::new(source.slice(1, values.len())) as ArrayRef,
+                    ),
+                    (
+                        "source",
+                        Arc::new(StringViewArray::from_iter_values(std::iter::repeat_n(
+                            "official-document-reference-with-shared-backing",
+                            values.len(),
+                        ))) as ArrayRef,
+                    ),
+                ])
+                .unwrap();
+                drop(source);
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+                let input = MemoryConsumer::new("source views").register(&pool);
+                input
+                    .try_grow(allocation_bytes(&batch, |_, _| false))
+                    .unwrap();
+                let batch = hold_batch(batch, input).unwrap();
+                let input = Box::pin(RecordBatchStreamAdapter::new(
+                    batch.schema(),
+                    futures::stream::iter([Ok(batch)]),
+                ));
+                let frames = encode(input, Arc::clone(&pool), compression, 64 * 1024)
+                    .unwrap()
+                    .map_ok(Encoded::into_data)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let decoded = FlightRecordBatchStream::new_from_flight_data(futures::stream::iter(
+                    frames.into_iter().map(Ok),
+                ))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+                let actual = decoded
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<StringViewArray>()
+                            .unwrap()
+                            .iter()
+                            .map(|value| value.map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, values);
+                for batch in &decoded {
+                    let sources = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .unwrap();
+                    assert!(
+                        sources.iter().all(|value| value
+                            == Some("official-document-reference-with-shared-backing"))
+                    );
+                }
+                drop(decoded);
+                assert_eq!(pool.reserved(), 0);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn eof_releases_encoding_scratch_while_returned_slices_keep_only_wire_charges() {

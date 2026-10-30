@@ -77,6 +77,8 @@ about a user's networking or deployment stack.
     - Docs and examples (PR prefixed with `docs:`)
     - Performance (PR prefixed with `perf:`)
 
+Flight transport must admit native view compaction before sizing IPC fragments. Base the encoding allowance on the compacted buffers, and retain separate charges for newly owned compaction buffers through their actual lifetime.
+
 ## Task-specific guidance
 
 Read the relevant contributor guide before starting work in these areas:
