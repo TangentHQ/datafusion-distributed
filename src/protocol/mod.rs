@@ -1,3 +1,5 @@
+mod plan_memory;
+pub(crate) use plan_memory::PlanMemory;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 
@@ -13,5 +15,6 @@ pub use worker_channel::{
     ApplyDynamicFilter, CoordinatorToWorkerMsg, ExecuteTaskRequest, GetWorkerInfoRequest,
     GetWorkerInfoResponse, LoadInfo, ProducedDynamicFilter, SetPlanRequest,
     TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, WorkUnitBatch,
-    WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
+    WorkUnitDemand, WorkUnitFeedDeclaration, WorkUnitMsg, WorkUnitResponse, WorkerChannel,
+    WorkerToCoordinatorMsg,
 };

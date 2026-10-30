@@ -9,6 +9,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// Owns query tokio task spawning and error propagation.
+#[derive(Clone)]
 pub(super) struct Spawner {
     // Cancelled when the main execution future completes or is dropped.
     query_finished: CancellationToken,

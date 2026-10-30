@@ -34,6 +34,8 @@ use std::time::Duration;
 pub struct RowGeneratorWorkUnit {
     #[prost(uint64, tag = "1")]
     n_rows: u64,
+    #[prost(uint64, tag = "2")]
+    pub(crate) identity: u64,
 }
 
 /// A scripted operation that the [`RowGeneratorFeedProvider`] performs on the
@@ -103,12 +105,22 @@ pub struct RowGeneratorFeedProvider {
     per_partition_ops: Vec<Vec<WorkUnitOp>>,
     task_count: usize,
     metrics: ExecutionPlanMetricsSet,
+    shared: Option<Arc<std::sync::Mutex<std::collections::VecDeque<u64>>>>,
 }
 
 impl RowGeneratorFeedProvider {
+    pub fn shared(task_count: usize, ids: impl IntoIterator<Item = u64>) -> Self {
+        Self {
+            per_partition_ops: vec![vec![]; task_count],
+            task_count,
+            metrics: ExecutionPlanMetricsSet::new(),
+            shared: Some(Arc::new(std::sync::Mutex::new(ids.into_iter().collect()))),
+        }
+    }
     pub fn new(task_count: usize, per_partition_ops: Vec<Vec<WorkUnitOp>>) -> Self {
         Self {
             per_partition_ops,
+            shared: None,
             task_count,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -129,6 +141,21 @@ impl WorkUnitFeedProvider for RowGeneratorFeedProvider {
         partition: usize,
         _ctx: Arc<TaskContext>,
     ) -> Result<BoxStream<'static, Result<Self::WorkUnit>>> {
+        if let Some(queue) = &self.shared {
+            return Ok(
+                futures::stream::unfold(Arc::clone(queue), |queue| async move {
+                    let identity = queue.lock().unwrap().pop_front()?;
+                    Some((
+                        Ok(RowGeneratorWorkUnit {
+                            n_rows: 1,
+                            identity,
+                        }),
+                        queue,
+                    ))
+                })
+                .boxed(),
+            );
+        }
         let counter: Count =
             MetricBuilder::new(&self.metrics).counter("work_units_sent", partition);
         let ops = self
@@ -150,7 +177,13 @@ impl WorkUnitFeedProvider for RowGeneratorFeedProvider {
                 match op {
                     WorkUnitOp::Rows(n) => {
                         state.counter.add(1);
-                        return Some((Ok(RowGeneratorWorkUnit { n_rows: n }), state));
+                        return Some((
+                            Ok(RowGeneratorWorkUnit {
+                                n_rows: n,
+                                identity: 0,
+                            }),
+                            state,
+                        ));
                     }
                     WorkUnitOp::Wait(d) => {
                         tokio::time::sleep(d).await;
@@ -165,6 +198,15 @@ impl WorkUnitFeedProvider for RowGeneratorFeedProvider {
         });
         Ok(stream.boxed())
     }
+}
+
+/// Barrier shared by localhost test workers. IDs are observed after delivery
+/// and before producing rows, so slow execution cannot be confused with a slow
+/// coordinator descriptor feed.
+#[derive(Debug)]
+pub struct ScanGate {
+    pub started: tokio::sync::mpsc::UnboundedSender<(i64, u64)>,
+    pub release: tokio::sync::Semaphore,
 }
 
 /// Leaf execution plan that holds a [`WorkUnitFeed`] directly. During execution, it pulls
@@ -415,27 +457,55 @@ impl ExecutionPlan for RowGeneratorExec {
         let tag = self.tag.clone();
         let projection = self.projection.clone();
 
-        let stream = work_unit_feed.map(move |msg_result| {
-            let msg = msg_result?;
-            let n_rows = msg.n_rows as usize;
-            // Build all columns, then select only the projected ones.
-            let all_columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
-                Arc::new(StringArray::from(vec![tag.as_str(); n_rows])),
-                Arc::new(Int64Array::from(vec![task_index; n_rows])),
-                Arc::new(Int64Array::from(vec![partition_idx; n_rows])),
-                Arc::new(StringArray::from(
-                    (0..n_rows).map(|i| ABC[i % ABC.len()]).collect::<Vec<_>>(),
-                )),
-            ];
-            let columns = match &projection {
-                Some(indices) => indices
-                    .iter()
-                    .map(|&i| Arc::clone(&all_columns[i]))
-                    .collect(),
-                None => all_columns,
-            };
-            let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
-            Ok(batch)
+        let gate = context.session_config().get_extension::<ScanGate>();
+        let feedback = self.feed.feedback.then(|| self.feed.clone());
+        let stream = work_unit_feed.then(move |msg_result| {
+            let feedback = feedback.clone();
+            let context = context.clone();
+            let gate = gate.clone();
+            let tag = tag.clone();
+            let projection = projection.clone();
+            let schema = schema.clone();
+            async move {
+                let msg = msg_result?;
+                if let Some(gate) = gate {
+                    let _ = gate.started.send((task_index, msg.identity));
+                    if msg.identity == 1 {
+                        gate.release.acquire().await.unwrap().forget();
+                    }
+                }
+                let tag = if msg.identity == 0 {
+                    tag
+                } else {
+                    format!("{tag}:{}", msg.identity)
+                };
+                let n_rows = msg.n_rows as usize;
+                // Build all columns, then select only the projected ones.
+                let all_columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
+                    Arc::new(StringArray::from(vec![tag.as_str(); n_rows])),
+                    Arc::new(Int64Array::from(vec![task_index; n_rows])),
+                    Arc::new(Int64Array::from(vec![partition_idx; n_rows])),
+                    Arc::new(StringArray::from(
+                        (0..n_rows).map(|i| ABC[i % ABC.len()]).collect::<Vec<_>>(),
+                    )),
+                ];
+                let columns = match &projection {
+                    Some(indices) => indices
+                        .iter()
+                        .map(|&i| Arc::clone(&all_columns[i]))
+                        .collect(),
+                    None => all_columns,
+                };
+                let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+                if let Some(feed) = feedback {
+                    feed.complete(
+                        partition,
+                        context,
+                        bytes::Bytes::copy_from_slice(&msg.identity.to_le_bytes()),
+                    )?;
+                }
+                Ok(batch)
+            }
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(

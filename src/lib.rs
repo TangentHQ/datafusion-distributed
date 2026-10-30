@@ -23,6 +23,7 @@ pub use coordinator::DistributedExec;
 pub use distributed_ext::{DistributedExt, DistributedGetterExt};
 pub use distributed_planner::{
     DistributedConfig, NetworkBoundary, NetworkBoundaryExt, ProducerHead, SessionStateBuilderExt,
+    peer_streams,
 };
 pub use dynamic_filtering::rewrite_distributed_plan_with_dynamic_filters;
 pub use events::{
@@ -59,14 +60,15 @@ pub use protocol::{
     ApplyDynamicFilter, ChannelResolver, CoordinatorToWorkerMsg, ExecuteTaskRequest,
     GetWorkerInfoRequest, GetWorkerInfoResponse, LoadInfo, ProducedDynamicFilter, SetPlanRequest,
     TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, WorkUnitBatch,
-    WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
-    get_distributed_channel_resolver,
+    WorkUnitDemand, WorkUnitFeedDeclaration, WorkUnitMsg, WorkUnitResponse, WorkerChannel,
+    WorkerToCoordinatorMsg, get_distributed_channel_resolver,
 };
 pub use stage::{
     DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,
 };
 pub use work_unit_feed::{
-    DistributedWorkUnitFeedContext, WorkUnit, WorkUnitFeed, WorkUnitFeedProto, WorkUnitFeedProvider,
+    DistributedWorkUnitFeedContext, Feedback, OwnedWorkUnit, WorkUnit, WorkUnitFeed,
+    WorkUnitFeedProto, WorkUnitFeedProvider,
 };
 pub use worker::{
     CoordinatorChannelResult, DefaultSessionBuilder, MappedWorkerSessionBuilder,

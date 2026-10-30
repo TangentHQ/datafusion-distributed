@@ -1,3 +1,4 @@
+use crate::common::memory::{allocation_bytes, hold_batch};
 use crate::common::{OnceLockResult, require_one_child};
 use crossbeam_queue::SegQueue;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -186,8 +187,20 @@ impl ExecutionPlan for BroadcastExec {
                     match msg {
                         Ok(record_batch) => {
                             let reservation = mem_consumer.clone_with_new_id().register(&pool);
-                            reservation.grow(record_batch.get_array_memory_size());
-                            queue.push(Ok((record_batch, Arc::new(reservation))));
+                            if let Err(error) =
+                                reservation.try_grow(allocation_bytes(&record_batch, |_, _| false))
+                            {
+                                queue.push(Err(Arc::new(error)));
+                                break;
+                            }
+                            let reservation = Arc::new(reservation);
+                            match hold_batch(record_batch, Arc::clone(&reservation)) {
+                                Ok(batch) => queue.push(Ok((batch, reservation))),
+                                Err(error) => {
+                                    queue.push(Err(Arc::new(error)));
+                                    break;
+                                }
+                            }
                         }
                         Err(err) => {
                             queue.push(Err(Arc::new(err)));

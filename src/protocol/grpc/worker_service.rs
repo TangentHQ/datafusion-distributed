@@ -14,14 +14,12 @@ use crate::{
 
 use crate::worker::CoordinatorChannelResult;
 use arrow_flight::FlightData;
-use arrow_flight::encode::{DictionaryHandling, FlightDataEncoder, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
 use arrow_select::dictionary::garbage_collect_any_dictionary;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions};
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::ipc::CompressionType;
-use datafusion::arrow::ipc::writer::IpcWriteOptions;
 use datafusion::common::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_proto::protobuf;
@@ -162,26 +160,30 @@ impl pb::worker_service_server::WorkerService for Worker {
         };
         let mut flight_streams = Vec::with_capacity(arrow_streams.len());
         for (partition, arrow_stream) in partition_range.zip(arrow_streams) {
-            let flight_stream =
-                build_flight_data_stream(arrow_stream, compression)?.map(move |msg| {
-                    // For each FlightData produced by this stream, mark it with the appropriate
-                    // partition. This stream will be merged with several others from other partitions,
-                    // so marking it with the original partition allows it to be deconstructed into
-                    // the original per-partition streams in later steps.
-                    let flight_data = pb::FlightAppMetadata {
-                        partition: partition as u64,
-                        created_timestamp_unix_nanos: now_ns::<u64>(),
-                    };
-                    msg.map(|v| v.with_app_metadata(flight_data.encode_to_vec()))
-                });
+            let flight_stream = build_flight_data_stream(
+                arrow_stream,
+                compression,
+                self.max_message_size.unwrap_or(usize::MAX),
+                Arc::clone(task_ctx.memory_pool()),
+            )?
+            .map(move |msg| {
+                // For each FlightData produced by this stream, mark it with the appropriate
+                // partition. This stream will be merged with several others from other partitions,
+                // so marking it with the original partition allows it to be deconstructed into
+                // the original per-partition streams in later steps.
+                let flight_data = pb::FlightAppMetadata {
+                    partition: partition as u64,
+                    created_timestamp_unix_nanos: now_ns::<u64>(),
+                };
+                msg.map(|v| v.metadata(flight_data.encode_to_vec()))
+            });
 
             flight_streams.push(flight_stream);
         }
 
         // Merge all the per-partition streams into one. Each message in the stream is marked with
         // the original partition, so they can be reconstructed at the other side of the boundary.
-        let memory_pool = Arc::clone(&task_ctx.runtime_env().memory_pool);
-        let stream = spawn_select_all(flight_streams, memory_pool, RECORD_BATCH_BUFFER_SIZE);
+        let stream = spawn_select_all(flight_streams, RECORD_BATCH_BUFFER_SIZE);
 
         Ok(Response::new(Box::pin(stream.map_err(|err| match err {
             FlightError::Tonic(status) => *status,
@@ -214,6 +216,22 @@ fn decode_coordinator_to_worker_msg(
             }
             pb::coordinator_to_worker_msg::Inner::WorkUnitBatch(batch) => {
                 CoordinatorToWorkerMsg::WorkUnitBatch(decode_work_unit_batch(batch)?)
+            }
+            pb::coordinator_to_worker_msg::Inner::WorkUnitResponse(response) => {
+                let demand = response
+                    .demand
+                    .ok_or_else(missing("work_unit_response.demand"))?;
+                CoordinatorToWorkerMsg::WorkUnitResponse(crate::WorkUnitResponse {
+                    demand: crate::WorkUnitDemand {
+                        id: deserialize_uuid(&demand.id)
+                            .map_err(datafusion_error_to_tonic_status)?,
+                        partition: usize::try_from(demand.partition)
+                            .map_err(|_| Status::invalid_argument("Demand partition overflow"))?,
+                        sequence: demand.sequence,
+                        feedback: demand.feedback.map(bytes::Bytes::from),
+                    },
+                    unit: response.unit.map(decode_work_unit).transpose()?,
+                })
             }
             pb::coordinator_to_worker_msg::Inner::WorkUnitEos(_) => {
                 CoordinatorToWorkerMsg::WorkUnitEos
@@ -286,6 +304,11 @@ fn encode_worker_to_coordinator_msg(
 ) -> Result<pb::WorkerToCoordinatorMsg, Status> {
     Ok(pb::WorkerToCoordinatorMsg {
         inner: Some(match msg {
+            WorkerToCoordinatorMsg::WorkUnitDemand(demand) => {
+                pb::worker_to_coordinator_msg::Inner::WorkUnitDemand(
+                    super::worker_client::encode_work_unit_demand(demand),
+                )
+            }
             WorkerToCoordinatorMsg::TaskMetrics(task_metrics) => {
                 pb::worker_to_coordinator_msg::Inner::TaskMetrics(encode_task_metrics(
                     task_metrics,
@@ -405,6 +428,7 @@ fn decode_work_unit_feed_declaration(
     Ok(WorkUnitFeedDeclaration {
         id: deserialize_uuid(&declaration.id).map_err(datafusion_error_to_tonic_status)?,
         partitions: declaration.partitions as usize,
+        demand: declaration.demand,
     })
 }
 
@@ -431,40 +455,14 @@ fn missing(field: &'static str) -> impl FnOnce() -> Status {
 
 fn build_flight_data_stream(
     stream: SendableRecordBatchStream,
-    compression_type: Option<CompressionType>,
-) -> datafusion::common::Result<FlightDataEncoder, Status> {
-    let stream = FlightDataEncoderBuilder::new()
-        .with_options(
-            IpcWriteOptions::default()
-                .try_with_compression(compression_type)
-                .map_err(|err| Status::internal(err.to_string()))?,
-        )
-        .with_schema(stream.schema())
-        // This tells the encoder to send dictionaries across the wire as-is.
-        // The alternative (`DictionaryHandling::Hydrate`) would expand the dictionaries
-        // into their value types, which can potentially blow up the size of the data transfer.
-        // The main reason to use `DictionaryHandling::Hydrate` is for compatibility with clients
-        // that do not support dictionaries, but since we are using the same server/client on both
-        // sides, we can safely use `DictionaryHandling::Resend`.
-        // Note that we do garbage collection of unused dictionary values above, so we are not sending
-        // unused dictionary values over the wire.
-        .with_dictionary_handling(DictionaryHandling::Resend)
-        // Set max flight data size to unlimited.
-        // This requires servers and clients to also be configured to handle unlimited sizes.
-        // Using unlimited sizes avoids splitting RecordBatches into multiple FlightData messages,
-        // which could add significant overhead for large RecordBatches.
-        // The only reason to split them really is if the client/server are configured with a message size limit,
-        // which mainly makes sense in a public network scenario where you want to avoid DoS attacks.
-        // Since all of our Arrow Flight communication happens within trusted data plane networks,
-        // we can safely use unlimited sizes here.
-        .with_max_flight_data_size(usize::MAX)
-        .build(
-            stream
-                // Apply garbage collection of dictionary and view arrays before sending over the network
-                .and_then(|rb| std::future::ready(garbage_collect_arrays(rb)))
-                .map_err(|err| FlightError::Tonic(Box::new(datafusion_error_to_tonic_status(err)))),
-        );
-    Ok(stream)
+    compression: Option<CompressionType>,
+    size: usize,
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) -> datafusion::common::Result<
+    BoxStream<'static, Result<super::encode::Encoded, FlightError>>,
+    Status,
+> {
+    super::encode::encode(stream, pool, compression, size).map_err(datafusion_error_to_tonic_status)
 }
 
 /// Garbage collects values sub-arrays.
@@ -474,7 +472,7 @@ fn build_flight_data_stream(
 ///
 /// Unused values can arise from operations such as filtering, where
 /// some keys may no longer be referenced in the filtered result.
-fn garbage_collect_arrays(
+pub(super) fn garbage_collect_arrays(
     batch: RecordBatch,
 ) -> datafusion::common::Result<RecordBatch, DataFusionError> {
     let (schema, arrays, row_count) = batch.into_parts();
@@ -482,12 +480,26 @@ fn garbage_collect_arrays(
     let arrays = arrays
         .into_iter()
         .map(|array| {
-            if let Some(array) = array.as_any_dictionary_opt() {
-                garbage_collect_any_dictionary(array)
-            } else if let Some(array) = array.as_string_view_opt() {
-                Ok(Arc::new(array.gc()) as Arc<dyn Array>)
-            } else if let Some(array) = array.as_binary_view_opt() {
-                Ok(Arc::new(array.gc()) as Arc<dyn Array>)
+            if let Some(dictionary) = array.as_any_dictionary_opt() {
+                if dictionary.values().len().saturating_mul(16)
+                    < dictionary.values().get_buffer_memory_size()
+                {
+                    garbage_collect_any_dictionary(dictionary)
+                } else {
+                    Ok(array)
+                }
+            } else if let Some(view) = array.as_string_view_opt() {
+                if view.total_buffer_bytes_used() < view.get_buffer_memory_size() {
+                    Ok(Arc::new(view.gc()) as Arc<dyn Array>)
+                } else {
+                    Ok(array)
+                }
+            } else if let Some(view) = array.as_binary_view_opt() {
+                if view.total_buffer_bytes_used() < view.get_buffer_memory_size() {
+                    Ok(Arc::new(view.gc()) as Arc<dyn Array>)
+                } else {
+                    Ok(array)
+                }
             } else {
                 Ok(array)
             }

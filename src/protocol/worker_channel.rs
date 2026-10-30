@@ -56,6 +56,8 @@ pub enum CoordinatorToWorkerMsg {
     WorkUnitBatch(WorkUnitBatch),
     /// Signals an EOS for WorkUnits. After this message is received, no more WorkUnits will be sent.
     WorkUnitEos,
+    /// The single reply to a sequenced demand; None marks this partition EOF.
+    WorkUnitResponse(WorkUnitResponse),
     /// Sends a dynamic-filter update to one consumer task which should be applied locally.
     ApplyDynamicFilter(Box<ApplyDynamicFilter>),
 }
@@ -85,6 +87,8 @@ pub struct WorkUnitFeedDeclaration {
     pub id: Uuid,
     /// The amount of partitions expected to be streamed.
     pub partitions: usize,
+    /// Pull one item only when the worker asks; no speculative descriptor queue.
+    pub demand: bool,
 }
 
 pub struct SetPlanRequest {
@@ -133,7 +137,25 @@ pub struct WorkUnitMsg {
     pub processed_timestamp_unix_nanos: usize,
 }
 
+/// Bound to the TaskKey of the coordinator channel carrying it. Sequences start
+/// at zero and advance once per response, so duplicates fail the query.
+#[derive(Clone, Debug)]
+pub struct WorkUnitDemand {
+    pub id: Uuid,
+    pub partition: usize,
+    pub sequence: u64,
+    /// Completion of the descriptor returned for sequence-1. The exact
+    /// task/feed/partition is implicit in this authenticated channel.
+    pub feedback: Option<bytes::Bytes>,
+}
+
+pub struct WorkUnitResponse {
+    pub demand: WorkUnitDemand,
+    pub unit: Option<WorkUnitMsg>,
+}
+
 pub enum WorkerToCoordinatorMsg {
+    WorkUnitDemand(WorkUnitDemand),
     /// Sends the metrics collected during task execution back to the coordinator.
     /// This is sent after all partitions of a task have finished (or been dropped),
     /// ensuring metrics are never lost due to early stream termination.

@@ -4,9 +4,7 @@ use datafusion::common::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{Partitioning, PhysicalExpr};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_proto::bytes::{
-    physical_plan_from_bytes_with_proto_converter, physical_plan_to_bytes_with_proto_converter,
-};
+use datafusion_proto::bytes::physical_plan_from_bytes_with_proto_converter;
 use datafusion_proto::physical_plan::from_proto::parse_protobuf_partitioning;
 use datafusion_proto::physical_plan::to_proto::serialize_partitioning;
 use datafusion_proto::physical_plan::{
@@ -31,8 +29,24 @@ pub(crate) fn encode_execution_plan(
 ) -> Result<Vec<u8>> {
     let codec = DistributedCodec::new_combined_with_user(task_ctx.session_config());
     let converter = new_proto_converter();
-    physical_plan_to_bytes_with_proto_converter(plan, &codec, &converter)
-        .map(|bytes| bytes.to_vec())
+    let proto = converter.execution_plan_to_proto(&plan, &codec)?;
+    let size = proto.encoded_len();
+    if let Some(memory) = task_ctx
+        .session_config()
+        .get_extension::<crate::protocol::PlanMemory>()
+    {
+        memory.retain(
+            size.checked_mul(2)
+                .ok_or_else(|| proto_error("Encoded plan size overflow"))?,
+        )?;
+    }
+    // Encode directly into its admitted vector instead of Bytes followed by
+    // another complete to_vec copy.
+    let mut bytes = Vec::with_capacity(size);
+    proto
+        .encode(&mut bytes)
+        .map_err(|error| proto_error(error.to_string()))?;
+    Ok(bytes)
 }
 
 pub(crate) fn decode_execution_plan(

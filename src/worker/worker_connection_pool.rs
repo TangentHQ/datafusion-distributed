@@ -267,7 +267,10 @@ mod tests {
             .await
             .expect("abandoned probe must not block its sibling")?;
         assert_values(&batches);
-        // Keep the connection pool alive: cancellation must not depend on dropping the pool.
+        // Output arrays keep their allocation after queue permits end.
+        // Keep the connection pool alive while dropping the returned bytes.
+        assert!(fixture.ctx.memory_pool().reserved() > 0);
+        drop(batches);
         assert_eq!(fixture.ctx.memory_pool().reserved(), 0);
         Ok(())
     }
@@ -290,6 +293,9 @@ mod tests {
         .expect("consuming both partitions should release backpressure")?;
         assert_values(&idle);
         assert_values(&active);
+        assert!(fixture.ctx.memory_pool().reserved() > 0);
+        drop(idle);
+        drop(active);
         assert_eq!(fixture.ctx.memory_pool().reserved(), 0);
         Ok(())
     }

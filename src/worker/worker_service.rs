@@ -19,6 +19,9 @@ pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<Result
 #[derive(Clone)]
 pub struct Worker {
     pub(super) runtime: Arc<RuntimeEnv>,
+    pub(super) readers: tokio_util::task::TaskTracker,
+    pub(super) closed: tokio_util::sync::CancellationToken,
+    pub(super) admission: Arc<tokio::sync::RwLock<()>>,
     /// Shares task state across partition requests. Coordinator-channel termination releases
     /// the stored task resources; time-to-idle eviction provides fallback cleanup for entries
     /// left by abandoned setup requests.
@@ -35,6 +38,9 @@ impl Default for Worker {
         let cache = Cache::builder().time_to_idle(TASK_CACHE_TTI).build();
         Self {
             runtime: Arc::new(RuntimeEnv::default()),
+            readers: tokio_util::task::TaskTracker::new(),
+            closed: tokio_util::sync::CancellationToken::new(),
+            admission: Arc::new(tokio::sync::RwLock::new(())),
             task_data_entries: Arc::new(cache),
             session_builder: Arc::new(DefaultSessionBuilder),
             max_message_size: Some(usize::MAX),
@@ -46,6 +52,18 @@ impl Default for Worker {
 }
 
 impl Worker {
+    /// End this worker's query scope and join its coordinator readers before
+    /// releasing VM resources. Existing output arrays keep their own charges.
+    /// This is cancellation and cleanup, never a task retry or reassignment.
+    pub async fn shutdown(&self) {
+        self.closed.cancel();
+        let _admission = self.admission.write().await;
+        self.readers.close();
+        self.readers.wait().await;
+        self.task_data_entries.invalidate_all();
+        self.task_data_entries.run_pending_tasks().await;
+    }
+
     /// Builds a [Worker] with a custom [WorkerSessionBuilder]. Use this
     /// method whenever you need to add custom stuff to the `SessionContext` that executes the query.
     pub fn from_session_builder(

@@ -1,8 +1,10 @@
 use super::channel_resolver::BoxCloneSyncChannel;
+use super::errors::datafusion_error_to_tonic_status;
 use super::errors::{map_flight_to_datafusion_error, map_status_to_datafusion_error};
 use super::generated::worker as pb;
 use super::metrics_proto::metrics_set_proto_to_df;
-use crate::common::{RetryOutcome, on_drop_stream, serialize_uuid};
+use crate::common::memory::hold_bytes;
+use crate::common::{RetryOutcome, deserialize_uuid, on_drop_stream, serialize_uuid};
 use crate::grpc::errors::tonic_status_to_datafusion_error;
 use crate::grpc::generated::worker::FlightAppMetadata;
 use crate::{
@@ -14,7 +16,6 @@ use crate::{
     WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
 };
 use arrow_flight::FlightData;
-use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
@@ -34,8 +35,8 @@ use pin_project::{pin_project, pinned_drop};
 use prost::Message;
 use std::borrow::Cow;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -55,9 +56,20 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
         metrics: ExecutionPlanMetricsSet,
         ctx: &Arc<TaskContext>,
     ) -> Result<BoxStream<'static, Result<WorkerToCoordinatorMsg>>> {
-        let set_plan_request = encode_set_plan_request(set_plan_request, ctx)?;
+        let ctx = Arc::new(crate::common::task_ctx_with_extension(
+            ctx,
+            crate::protocol::PlanMemory::new(ctx.memory_pool()),
+        ));
+        let memory = ctx
+            .session_config()
+            .get_extension::<crate::protocol::PlanMemory>()
+            .ok_or_else(|| {
+                datafusion::common::internal_datafusion_err!("Missing encoded plan owner")
+            })?;
+        let set_plan_request = encode_set_plan_request(set_plan_request, &ctx)?;
+        memory.retain(set_plan_request.encoded_len())?;
         let plan_bytes_sent = set_plan_request.plan_proto.len();
-        let task_ctx = Arc::clone(ctx);
+        let task_ctx = Arc::clone(&ctx);
         // Tonic request streams cannot yield errors, so return encoding failures through
         // the response stream instead. Only the first failure matters.
         let (error_tx, mut error_rx) = channel(1);
@@ -69,6 +81,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
             }
         })
         .chain(c2w_stream.then(move |msg| {
+            let _memory = &memory;
             match encode_coordinator_to_worker_msg(msg, &task_ctx) {
                 Ok(msg) => Either::Left(ready(msg)),
                 Err(error) => {
@@ -154,6 +167,13 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
         // for them in the memory pool.
         let memory_reservation =
             Arc::new(MemoryConsumer::new("WorkerConnection").register(ctx.memory_pool()));
+        let frames = Arc::new(Mutex::new(Frames {
+            values: vec![],
+            memory: MemoryConsumer::new("WorkerWireRegistry").register(ctx.memory_pool()),
+        }));
+        let frames_for_task = Arc::clone(&frames);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let queued_for_task = Arc::clone(&queued);
 
         // Track the maximum memory used to buffer received messages.
         let mut curr_max_mem = 0;
@@ -249,7 +269,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 // and wake this gate so they cannot strand active sibling partitions.
                 // We always allow a message through when reservation == 0 to avoid
                 // livelock if a single message is larger than the budget.
-                while memory_reservation.size() >= buffer_budget_bytes {
+                while queued_for_task.load(Ordering::Acquire) > 0 && queued_for_task.load(Ordering::Acquire) >= buffer_budget_bytes {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
@@ -310,7 +330,30 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 // memory reservation means releasing the memory from the pool for that specific
                 // message
                 let size = flight_data.encoded_len();
-                memory_reservation.grow(size);
+                let charged = size.saturating_add(std::mem::size_of::<Frame>());
+                if let Err(error) = memory_reservation.try_grow(charged) {
+                    return fanout(&per_partition_tx, datafusion_error_to_tonic_status(error));
+                }
+                let frame = Arc::new(Frame {
+                    start: flight_data.data_body.as_ptr() as usize,
+                    length: flight_data.data_body.len(),
+                    reservation: Arc::clone(&memory_reservation),
+                    size: charged,
+                });
+                {
+                    let Ok(mut frames) = frames_for_task.lock() else {
+                        return fanout(&per_partition_tx, Status::internal("Flight memory registry is unavailable"));
+                    };
+                    if let Err(error) = frames.push(Arc::downgrade(&frame)) {
+                        return fanout(&per_partition_tx, datafusion_error_to_tonic_status(error));
+                    }
+                }
+                let flight_data = FlightData {
+                    data_header: hold_bytes(flight_data.data_header, Arc::clone(&frame)),
+                    data_body: hold_bytes(flight_data.data_body, Arc::clone(&frame)),
+                    app_metadata: hold_bytes(flight_data.app_metadata, frame),
+                    ..flight_data
+                };
 
                 // Update memory related metrics.
                 msg_count.add(1);
@@ -322,10 +365,11 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 }
 
                 let reservation = FlightReservation {
-                    reservation: Arc::clone(&memory_reservation),
+                    queued: Arc::clone(&queued_for_task),
                     size,
                     notify: Arc::clone(&mem_available_notify_for_task),
                 };
+                queued_for_task.fetch_add(size, Ordering::AcqRel);
                 if o_tx.send(Ok((flight_data, reservation))).is_err() {
                     // The receiver for this partition was dropped (e.g. a hash join partition
                     // completed early without consuming its probe side). Don't exit: other
@@ -356,8 +400,28 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 let _ = &task; // <- keep the task that polls data from the network alive.
                 data
             });
-            let stream = FlightRecordBatchStream::new_from_flight_data(stream);
-            let stream = stream.map_err(map_flight_to_datafusion_error);
+            let frames = Arc::clone(&frames);
+            let mut decoder = super::decode::Decoder::new(Arc::clone(ctx.memory_pool()));
+            let stream = stream.filter_map(move |message| {
+                let result = (|| {
+                    let data = message.map_err(map_flight_to_datafusion_error)?;
+                    let frames = frames.lock().map_err(|_| {
+                        DataFusionError::Execution("Flight memory registry is unavailable".into())
+                    })?;
+                    decoder.decode(data, |start, length| {
+                        frames
+                            .values
+                            .iter()
+                            .filter_map(Weak::upgrade)
+                            .any(|frame| frame.contains(start, length))
+                    })
+                })();
+                ready(match result {
+                    Ok(Some(batch)) => Some(Ok(batch)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                })
+            });
             let stream = stream.with_elapsed_compute(elapsed_compute_clone.clone());
 
             // When the stream is dropped, cancel the background task to ensure prompt cleanup.
@@ -396,15 +460,54 @@ type WorkerMsg = Result<(FlightData, FlightReservation), Status>;
 /// Release queued bytes on consumption, receiver cancellation, or a failed send.
 /// Waking the shared reader is necessary even when no consumer polls this partition again.
 struct FlightReservation {
-    reservation: Arc<MemoryReservation>,
+    queued: Arc<AtomicUsize>,
     size: usize,
     notify: Arc<Notify>,
 }
 
 impl Drop for FlightReservation {
     fn drop(&mut self) {
-        self.reservation.shrink(self.size);
+        self.queued.fetch_sub(self.size, Ordering::AcqRel);
         self.notify.notify_one();
+    }
+}
+
+/// A wire allocation may back decoded arrays and dictionaries without a copy.
+/// Retain its charge in Bytes; queue credits are released independently.
+struct Frame {
+    start: usize,
+    length: usize,
+    reservation: Arc<MemoryReservation>,
+    size: usize,
+}
+impl Frame {
+    fn contains(&self, start: usize, length: usize) -> bool {
+        start >= self.start
+            && start
+                .checked_add(length)
+                .is_some_and(|end| end <= self.start.saturating_add(self.length))
+    }
+}
+impl Drop for Frame {
+    fn drop(&mut self) {
+        self.reservation.shrink(self.size);
+    }
+}
+
+struct Frames {
+    values: Vec<Weak<Frame>>,
+    memory: MemoryReservation,
+}
+impl Frames {
+    fn push(&mut self, frame: Weak<Frame>) -> Result<()> {
+        self.values.retain(|frame| frame.strong_count() > 0);
+        if self.values.len() == self.values.capacity() {
+            let capacity = self.values.capacity().saturating_mul(2).max(4);
+            self.memory
+                .try_resize(capacity.saturating_mul(std::mem::size_of::<Weak<Frame>>()))?;
+        }
+        self.values.push(frame);
+        Ok(())
     }
 }
 
@@ -507,6 +610,12 @@ fn encode_coordinator_to_worker_msg(
             CoordinatorToWorkerMsg::WorkUnitBatch(batch) => {
                 pb::coordinator_to_worker_msg::Inner::WorkUnitBatch(encode_work_unit_batch(batch))
             }
+            CoordinatorToWorkerMsg::WorkUnitResponse(response) => {
+                pb::coordinator_to_worker_msg::Inner::WorkUnitResponse(pb::WorkUnitResponse {
+                    demand: Some(encode_work_unit_demand(response.demand)),
+                    unit: response.unit.map(encode_work_unit),
+                })
+            }
             CoordinatorToWorkerMsg::WorkUnitEos => {
                 pb::coordinator_to_worker_msg::Inner::WorkUnitEos(true)
             }
@@ -542,6 +651,15 @@ fn encode_set_plan_request(
     })
 }
 
+pub(super) fn encode_work_unit_demand(demand: crate::WorkUnitDemand) -> pb::WorkUnitDemand {
+    pb::WorkUnitDemand {
+        id: serialize_uuid(&demand.id),
+        partition: demand.partition as u64,
+        sequence: demand.sequence,
+        feedback: demand.feedback.map(|body| body.to_vec()),
+    }
+}
+
 fn encode_work_unit_batch(batch: WorkUnitBatch) -> pb::WorkUnitBatch {
     pb::WorkUnitBatch {
         batch: batch.batch.into_iter().map(encode_work_unit).collect(),
@@ -569,6 +687,7 @@ fn encode_work_unit_feed_declaration(
     pb::set_plan_request::WorkUnitFeedDeclaration {
         id: serialize_uuid(&declaration.id),
         partitions: declaration.partitions as u64,
+        demand: declaration.demand,
     }
 }
 
@@ -588,6 +707,16 @@ fn decode_worker_to_coordinator_msg(
             .inner
             .ok_or_else(|| missing("WorkerToCoordinatorMsg.inner"))?
         {
+            pb::worker_to_coordinator_msg::Inner::WorkUnitDemand(demand) => {
+                WorkerToCoordinatorMsg::WorkUnitDemand(crate::WorkUnitDemand {
+                    id: deserialize_uuid(&demand.id)?,
+                    partition: usize::try_from(demand.partition).map_err(|_| {
+                        datafusion::common::exec_datafusion_err!("Demand partition overflow")
+                    })?,
+                    sequence: demand.sequence,
+                    feedback: demand.feedback.map(bytes::Bytes::from),
+                })
+            }
             pb::worker_to_coordinator_msg::Inner::TaskMetrics(task_metrics) => {
                 WorkerToCoordinatorMsg::TaskMetrics(decode_task_metrics(task_metrics)?)
             }
@@ -710,10 +839,20 @@ fn fanout(o_txs: &[UnboundedSender<WorkerMsg>], err: Status) {
 /// }
 /// ```
 pub fn create_worker_client(channel: BoxCloneSyncChannel) -> Box<dyn WorkerChannel> {
+    create_worker_client_with_limit(channel, usize::MAX)
+}
+
+/// Configure a finite encoded-message ceiling independently of the Flight
+/// encoder's fragmentation target. The caller derives this ceiling from its
+/// admitted worker envelope, including protobuf framing overhead.
+pub fn create_worker_client_with_limit(
+    channel: BoxCloneSyncChannel,
+    limit: usize,
+) -> Box<dyn WorkerChannel> {
     Box::new(
         pb::worker_service_client::WorkerServiceClient::new(channel)
-            .max_decoding_message_size(usize::MAX)
-            .max_encoding_message_size(usize::MAX),
+            .max_decoding_message_size(limit)
+            .max_encoding_message_size(limit),
     )
 }
 

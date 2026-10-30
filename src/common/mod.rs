@@ -1,6 +1,7 @@
 mod children_helpers;
 mod macros;
 mod maybe_encoded;
+pub(crate) mod memory;
 mod on_drop_stream;
 mod once_lock;
 mod recursion;
