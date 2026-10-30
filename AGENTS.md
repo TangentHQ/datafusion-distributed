@@ -55,6 +55,8 @@ about a user's networking or deployment stack.
   changes.
 - Follow established patterns in the closest relevant code and tests before
   introducing a new abstraction or mechanism.
+- Stateful physical nodes need per-task ownership on decoded local plans as
+  well as encoded worker plans; transport must not be the only isolation boundary.
 - Reuse existing helpers, extension points, and test fixtures when they fit.
 - Use DataFusion's error macros instead of manually constructing error variants or
   formatting error strings. Use `exec_err!`, `internal_err!`, etc. when returning

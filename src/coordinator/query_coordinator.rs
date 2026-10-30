@@ -13,7 +13,7 @@ use crate::dynamic_filtering::{
 use crate::events::{
     RouteTaskEvent, RouteTaskEventResponse, RouteTaskHandlers, new_coordinator_to_worker_dialer,
 };
-use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
+use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec, SamplerExec};
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::stage::LocalStage;
 use crate::work_unit_feed::{Demands, WorkUnitFeedRegistry};
@@ -545,16 +545,18 @@ impl<'a> StageCoordinator<'a> {
                 return Ok(Transformed::yes(Arc::new(ciu)));
             };
 
-            // Rebuild each RepartitionExec so every task gets its own instance with
-            // fresh partition state; sharing one across tasks causes a "partition not
-            // used yet" panic when the second task tries to pull from it.
-            if plan.downcast_ref::<RepartitionExec>().is_some() {
+            // Both nodes own streams consumed once. Rebuild them even when
+            // their children are unchanged: local workers receive decoded
+            // plans and need the same task isolation as the wire codec.
+            if plan.downcast_ref::<RepartitionExec>().is_some()
+                || plan.downcast_ref::<SamplerExec>().is_some()
+            {
                 let children = plan.children().into_iter().map(Arc::clone).collect();
-                let local_repartion_exec = plan.replace_children(
+                let local = plan.replace_children(
                     children,
                     ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
                 )?;
-                return Ok(Transformed::yes(local_repartion_exec));
+                return Ok(Transformed::yes(local));
             }
             // we are explicitly not retransforming the entire plan. if other operators cause shared state errors they will error out.
             Ok(Transformed {
@@ -641,6 +643,66 @@ impl CoordinatorToWorkerMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DistributedConfig, DistributedExt};
+    use datafusion::arrow::{
+        array::{ArrayRef, Int64Array},
+        record_batch::RecordBatch,
+    };
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::execution::SessionStateBuilder;
+
+    #[tokio::test]
+    async fn local_task_samplers_replay_their_own_input() -> Result<()> {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])?;
+        for tasks in [2, 4] {
+            let source =
+                MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)?;
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(SamplerExec::new(source));
+            let ctx = SessionStateBuilder::new()
+                .with_default_features()
+                .with_distributed_option_extension(DistributedConfig::default())
+                .build()
+                .task_ctx();
+            let mut output = RecordBatchReceiverStreamBuilder::new(plan.schema(), 2);
+            let coordinator = QueryCoordinator::new(
+                ctx.clone(),
+                &ExecutionPlanMetricsSet::new(),
+                None,
+                None,
+                &mut output,
+            );
+            let stage = LocalStage {
+                query_id: Uuid::new_v4(),
+                num: 1,
+                plan,
+                tasks,
+                metrics_set: Default::default(),
+            };
+            let channel = coordinator.stage_coordinator(&stage);
+            let mut plans = Vec::new();
+            let mut gates = Vec::new();
+            // Admit all tasks before consuming any, as a local worker does.
+            for task in 0..tasks {
+                let plan = channel.task_specialized_plan(task)?.plan;
+                let gate = SamplerExec::gate_for_first_sampler(plan.clone(), ctx.clone())?;
+                gate.kick_off();
+                plans.push(plan);
+                gates.push(gate);
+            }
+            for plan in plans {
+                let actual = plan
+                    .execute(0, ctx.clone())?
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                assert_eq!(actual, vec![batch.clone()]);
+            }
+            drop(gates);
+        }
+        Ok(())
+    }
 
     /// Regression test for a rustc miscompilation (present at least through
     /// 1.96, fixed in 1.98) of [`CoordinatorToWorkerMetrics::new`].
