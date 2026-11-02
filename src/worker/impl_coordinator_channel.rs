@@ -99,8 +99,11 @@ impl Worker {
         let (dynamic_filters_error_tx, dynamic_filters_error_rx) = channel(1);
 
         let memory = Arc::new(crate::protocol::PlanMemory::new(&self.runtime.memory_pool));
-        if let MaybeEncoded::Encoded(bytes) = &request.plan {
-            memory.retain(bytes.capacity())?;
+        if let MaybeEncoded::Encoded(bytes) = &request.plan
+            && let Err(error) = memory.retain(bytes.capacity())
+        {
+            self.release(key, &entry, true).await;
+            return Err(error);
         }
         let requester = has_demand.then(|| Arc::new(Requester(demand_tx)));
         let task_data = || async {
@@ -171,7 +174,15 @@ impl Worker {
             .write(task_data_result.clone())
             .map_err(|e| exec_datafusion_err!("{e}"))?;
 
-        let task_data = task_data_result.map_err(DataFusionError::Shared)?;
+        // A failed setup has no channel to release its entry later; waiting readers already hold
+        // the error.
+        let task_data = match task_data_result {
+            Ok(task_data) => task_data,
+            Err(error) => {
+                self.release(key, &entry, false).await;
+                return Err(DataFusionError::Shared(error));
+            }
+        };
         let mut sampler_gate = SamplerExec::gate_for_first_sampler(
             Arc::clone(&task_data.base_plan),
             Arc::clone(&task_data.task_ctx),

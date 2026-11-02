@@ -1,6 +1,5 @@
 use crate::ExecuteTaskRequest;
 use crate::worker::worker_service::Worker;
-use datafusion::common::exec_datafusion_err;
 use datafusion::common::{Result, exec_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -41,11 +40,15 @@ impl Worker {
 
         // Other request is responsible for writing the plan that belongs to this TaskKey, so
         // we'll resolve immediately if it was already there, or wait until it's ready.
-        let task_data = entry
-            .read(Duration::from_secs(WAIT_PLAN_TIMEOUT_SECS))
-            .await
-            .map_err(|e| exec_datafusion_err!("Worker::execute_task timed-out while waiting for the plan to be set by the coordinator. ({e})"))?
-            .map_err(DataFusionError::Shared)?;
+        let task_data = match entry.read(Duration::from_secs(WAIT_PLAN_TIMEOUT_SECS)).await {
+            Ok(task_data) => task_data,
+            Err(e) => {
+                // Entries do not expire by time, so the empty one this request created goes now.
+                self.release(request.task_key, &entry, true).await;
+                return exec_err!("Worker::execute_task timed-out while waiting for the plan to be set by the coordinator. ({e})");
+            }
+        }
+        .map_err(DataFusionError::Shared)?;
         task_data.task_data_metrics.mark_execution_started_once();
 
         let plan = task_data.plan(request.producer_head)?;
@@ -70,5 +73,34 @@ impl Worker {
             streams.push(Box::pin(RecordBatchStreamAdapter::new(stream_schema, stream)) as _);
         }
         Ok((streams, task_ctx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{ExecuteTaskRequest, ProducerHead, TaskKey, Worker};
+    use uuid::Uuid;
+
+    /// Entries no longer expire by time, so a request whose plan never arrives must not leave
+    /// its empty entry behind for the life of the worker.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_whose_plan_never_arrives_removes_its_entry() {
+        let worker = Worker::default();
+        let task_key = TaskKey {
+            query_id: Uuid::nil(),
+            stage_id: 1,
+            task_number: 0,
+        };
+        let result = worker
+            .execute_task(ExecuteTaskRequest {
+                task_key,
+                target_partition_start: 0,
+                target_partition_end: 1,
+                producer_head: ProducerHead::None,
+            })
+            .await;
+        assert!(result.is_err());
+        worker.task_data_entries.run_pending_tasks().await;
+        assert!(!worker.task_data_entries.contains_key(&task_key));
     }
 }
