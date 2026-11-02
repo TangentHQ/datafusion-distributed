@@ -98,6 +98,7 @@ chaos-tests = []
 sysinfo = ["dep:sysinfo"]
 
 [dev-dependencies]
+tokio = { version = "1.48", features = ["full", "test-util"] }
 datafusion-distributed-benchmarks = { path = "benchmarks" }
 # The crate's own tests drive `SessionContext::sql` and register parquet tables, so they need
 # both features regardless of which ones a consumer selects. Requesting them here keeps
