@@ -132,7 +132,15 @@ impl Worker {
             .write(task_data_result.clone())
             .map_err(|e| exec_datafusion_err!("{e}"))?;
 
-        let task_data = task_data_result.map_err(DataFusionError::Shared)?;
+        // A failed setup has no channel to release its entry later; waiting readers already hold
+        // the error.
+        let task_data = match task_data_result {
+            Ok(task_data) => task_data,
+            Err(error) => {
+                self.release(key, &entry, false).await;
+                return Err(DataFusionError::Shared(error));
+            }
+        };
         let mut sampler_gate = SamplerExec::gate_for_first_sampler(
             Arc::clone(&task_data.base_plan),
             Arc::clone(&task_data.task_ctx),
