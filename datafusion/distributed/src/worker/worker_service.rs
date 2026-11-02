@@ -8,10 +8,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 #[cfg(feature = "integration")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 use url::Url;
-
-const TASK_CACHE_TTI: Duration = Duration::from_mins(10);
 
 pub(crate) type ResultTaskData = Result<TaskData, Arc<DataFusionError>>;
 pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<ResultTaskData>>>;
@@ -19,9 +16,10 @@ pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<Result
 #[derive(Clone)]
 pub struct Worker {
     pub(super) runtime: Arc<RuntimeEnv>,
-    /// Shares task state across partition requests. Coordinator-channel termination releases
-    /// the stored task resources; time-to-idle eviction provides fallback cleanup for entries
-    /// left by abandoned setup requests.
+    /// Shares task state across partition requests. Nothing expires by time: a task's coordinator
+    /// sends its plan once, and a consumer may first ask for it long after that, so an entry lives
+    /// until its coordinator channel ends. Setup that fails, and requests whose plan never
+    /// arrives, remove the entries they left.
     pub(crate) task_data_entries: Arc<TaskDataEntries>,
     pub(super) session_builder: Arc<dyn WorkerSessionBuilder + Send + Sync>,
     pub(crate) max_message_size: Option<usize>,
@@ -32,7 +30,7 @@ pub struct Worker {
 
 impl Default for Worker {
     fn default() -> Self {
-        let cache = Cache::builder().time_to_idle(TASK_CACHE_TTI).build();
+        let cache = Cache::builder().build();
         Self {
             runtime: Arc::new(RuntimeEnv::default()),
             task_data_entries: Arc::new(cache),
@@ -46,6 +44,31 @@ impl Default for Worker {
 }
 
 impl Worker {
+    /// Removes `slot` from the cache if it is still the entry for `key`. With `unset`, only an
+    /// empty slot is removed, so a plan written meanwhile stays available.
+    pub(crate) async fn release(
+        &self,
+        key: TaskKey,
+        slot: &Arc<SingleWriteMultiRead<ResultTaskData>>,
+        unset: bool,
+    ) {
+        use moka::ops::compute::Op;
+        let slot = Arc::clone(slot);
+        self.task_data_entries
+            .entry(key)
+            .and_compute_with(|current| async move {
+                match current {
+                    Some(current)
+                        if Arc::ptr_eq(current.value(), &slot) && (!unset || slot.is_empty()) =>
+                    {
+                        Op::Remove
+                    }
+                    _ => Op::Nop,
+                }
+            })
+            .await;
+    }
+
     /// Builds a [Worker] with a custom [WorkerSessionBuilder]. Use this
     /// method whenever you need to add custom stuff to the `SessionContext` that executes the query.
     pub fn from_session_builder(
