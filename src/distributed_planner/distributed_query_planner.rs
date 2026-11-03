@@ -1254,8 +1254,32 @@ mod single_partition_tests {
     /// run the same head, or the coalesce asks for partitions the stage lacks.
     #[tokio::test]
     async fn coalesced_round_robin_stage_serves_every_advertised_partition() -> Result<()> {
-        use datafusion::physical_plan::{Partitioning, repartition::RepartitionExec};
-        for dynamic in [false, true] {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_plan::{
+            Partitioning, coalesce_partitions::CoalescePartitionsExec, repartition::RepartitionExec,
+        };
+        /// A caller's rule that gathers the optimized plan through a
+        /// round-robin spread, after DataFusion would have removed it.
+        #[derive(Debug)]
+        struct Spread;
+        impl PhysicalOptimizerRule for Spread {
+            fn optimize(
+                &self,
+                plan: Arc<dyn ExecutionPlan>,
+                _: &datafusion::config::ConfigOptions,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                let spread = RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(2))?;
+                Ok(Arc::new(CoalescePartitionsExec::new(Arc::new(spread))))
+            }
+            fn name(&self) -> &str {
+                "spread"
+            }
+            fn schema_check(&self) -> bool {
+                true
+            }
+        }
+        // Production plans adaptively, so its sampled stages go first.
+        for dynamic in [true, false] {
             let channels = InMemoryChannelResolver::from_session_builder(
                 |ctx: WorkerQueryContext| async move {
                     Ok(ctx
@@ -1284,6 +1308,7 @@ mod single_partition_tests {
                 .with_distributed_scale_up_leaf_node_handler(
                     row_generator_scale_up_leaf_node_handler,
                 )
+                .with_physical_optimizer_rule(Arc::new(Spread))
                 .with_distributed_planner()
                 .build();
             let ctx = SessionContext::new_with_state(state);
@@ -1298,12 +1323,7 @@ mod single_partition_tests {
                 None,
                 8,
             )) as Arc<dyn ExecutionPlan>;
-            // The stage root under the final coalesce is this repartition.
-            let spread = Arc::new(RepartitionExec::try_new(
-                leaf,
-                Partitioning::RoundRobinBatch(2),
-            )?) as Arc<dyn ExecutionPlan>;
-            ctx.register_table("input", Arc::new(Input(spread)))?;
+            ctx.register_table("input", Arc::new(Input(leaf)))?;
             let rows = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
                 ctx.sql("SELECT * FROM input").await?.collect(),
