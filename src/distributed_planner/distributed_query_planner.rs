@@ -1249,6 +1249,94 @@ mod single_partition_tests {
         )?;
         Ok(())
     }
+    /// A coalesced stage whose root is a round-robin repartition advertises
+    /// that repartition's partitions to its NetworkCoalesceExec. Workers must
+    /// run the same head, or the coalesce asks for partitions the stage lacks.
+    #[tokio::test]
+    async fn coalesced_round_robin_stage_serves_every_advertised_partition() -> Result<()> {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_plan::{
+            Partitioning, coalesce_partitions::CoalescePartitionsExec, repartition::RepartitionExec,
+        };
+        /// A caller's rule that gathers the optimized plan through a
+        /// round-robin spread, after DataFusion would have removed it.
+        #[derive(Debug)]
+        struct Spread;
+        impl PhysicalOptimizerRule for Spread {
+            fn optimize(
+                &self,
+                plan: Arc<dyn ExecutionPlan>,
+                _: &datafusion::config::ConfigOptions,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                let spread = RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(2))?;
+                Ok(Arc::new(CoalescePartitionsExec::new(Arc::new(spread))))
+            }
+            fn name(&self) -> &str {
+                "spread"
+            }
+            fn schema_check(&self) -> bool {
+                true
+            }
+        }
+        // Production plans adaptively, so its sampled stages go first.
+        for dynamic in [true, false] {
+            let channels = InMemoryChannelResolver::from_session_builder(
+                |ctx: WorkerQueryContext| async move {
+                    Ok(ctx
+                        .builder
+                        .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+                        .with_distributed_work_unit_feed(|leaf: &RowGeneratorExec| Some(&leaf.feed))
+                        .build())
+                },
+            );
+            let mut config = SessionConfig::new().with_target_partitions(2);
+            config.set_distributed_option_extension(DistributedConfig {
+                dynamic_task_count: dynamic,
+                max_tasks_per_stage: 2,
+                ..Default::default()
+            });
+            let state = SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(config)
+                .with_distributed_channel_resolver(channels)
+                .with_distributed_worker_resolver(InMemoryWorkerResolver::new(2))
+                .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+                .with_distributed_work_unit_feed(|leaf: &RowGeneratorExec| Some(&leaf.feed))
+                .with_distributed_desired_task_count_handler(
+                    row_generator_desired_task_count_handler,
+                )
+                .with_distributed_scale_up_leaf_node_handler(
+                    row_generator_scale_up_leaf_node_handler,
+                )
+                .with_physical_optimizer_rule(Arc::new(Spread))
+                .with_distributed_planner()
+                .build();
+            let ctx = SessionContext::new_with_state(state);
+            let provider = RowGeneratorFeedProvider::new(
+                2,
+                vec![vec![WorkUnitOp::Rows(4)], vec![WorkUnitOp::Rows(4)]],
+            );
+            let leaf = Arc::new(RowGeneratorExec::new(
+                crate::WorkUnitFeed::new(provider),
+                "input".into(),
+                1,
+                None,
+                8,
+            )) as Arc<dyn ExecutionPlan>;
+            ctx.register_table("input", Arc::new(Input(leaf)))?;
+            let rows = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                ctx.sql("SELECT * FROM input").await?.collect(),
+            )
+            .await
+            .expect("coalesced round-robin stage deadlocked")?
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
+            assert_eq!(rows, 8, "dynamic={dynamic}: every task's rows arrive once");
+        }
+        Ok(())
+    }
     /// All branch setup channels remain open until the query ends. The old
     /// per-partition cap deadlocks before the final branches can be prepared.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

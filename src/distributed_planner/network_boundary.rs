@@ -90,6 +90,12 @@ impl ProducerHead {
     /// Ensures the head of the provided plan complies with the passed [ProducerHead] definition. This
     /// can be called both during planning and lazily at runtime.
     pub(crate) fn insert(self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        // A coalesced stage keeps its own root. Its NetworkCoalesceExec was sized from that
+        // root's partitions, so stripping a round-robin repartition here would leave the
+        // consumer asking for partitions the stage no longer has.
+        if let ProducerHead::None = self {
+            return Ok(input);
+        }
         let input = if let Some(r_exec) = input.downcast_ref::<RepartitionExec>() {
             Arc::clone(r_exec.input())
         } else if let Some(b_exec) = input.downcast_ref::<BroadcastExec>() {
