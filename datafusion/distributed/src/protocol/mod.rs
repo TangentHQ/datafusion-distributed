@@ -13,5 +13,6 @@ pub use worker_channel::{
     ApplyDynamicFilter, CoordinatorToWorkerMsg, ExecuteTaskRequest, GetWorkerInfoRequest,
     GetWorkerInfoResponse, LoadInfo, ProducedDynamicFilter, SetPlanRequest,
     TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, WorkUnitBatch,
-    WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
+    WorkUnitDemand, WorkUnitFeedDeclaration, WorkUnitMsg, WorkUnitResponse, WorkerChannel,
+    WorkerToCoordinatorMsg,
 };

@@ -125,6 +125,8 @@ use uuid::Uuid;
 pub struct WorkUnitFeed<T: WorkUnitFeedProvider> {
     pub(crate) id: Uuid,
     pub(crate) provider: RemoteOrLocalProvider<T>,
+    pub(crate) demand: bool,
+    pub(crate) feedback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,10 +140,42 @@ impl<T: WorkUnitFeedProvider> RemoteOrLocalProvider<T> {
         &self,
         partition: usize,
         ctx: Arc<TaskContext>,
-    ) -> Result<BoxStream<'static, Result<T::WorkUnit>>> {
+        feedback: bool,
+        bound: fn(&[u8]) -> Result<usize>,
+    ) -> Result<BoxStream<'static, Result<super::remote_work_unit_feed::OwnedWorkUnit<T::WorkUnit>>>>
+    {
+        use futures::{StreamExt, TryStreamExt};
         match self {
-            Self::Local(local) => local.feed(partition, ctx),
-            Self::Remote(remote) => Ok(remote.feed::<T::WorkUnit>(partition, ctx)?),
+            Self::Local(local) => {
+                let pool = Arc::clone(ctx.memory_pool());
+                Ok(local
+                    .feed(partition, ctx)?
+                    .map_ok(move |value| {
+                        let memory = datafusion::execution::memory_pool::MemoryConsumer::new(
+                            "LocalWorkUnit",
+                        )
+                        .register(&pool);
+                        let size = prost::Message::encoded_len(&value);
+                        memory.try_grow(
+                            size.checked_mul(2)
+                                .and_then(|size| size.checked_add(512))
+                                .ok_or_else(|| {
+                                    datafusion::common::internal_datafusion_err!(
+                                        "Work unit size overflow"
+                                    )
+                                })?,
+                        )?;
+                        let encoded = prost::Message::encode_to_vec(&value);
+                        memory.try_resize(bound(&encoded)?)?;
+                        drop(encoded);
+                        Ok(super::remote_work_unit_feed::OwnedWorkUnit::new(
+                            value, memory,
+                        ))
+                    })
+                    .map(|result| result.and_then(|result| result))
+                    .boxed())
+            }
+            Self::Remote(remote) => remote.feed::<T::WorkUnit>(partition, ctx, feedback, bound),
         }
     }
 
@@ -157,6 +191,10 @@ impl<T: WorkUnitFeedProvider> RemoteOrLocalProvider<T> {
 pub struct WorkUnitFeedProto {
     #[prost(bytes, tag = "1")]
     pub id: Vec<u8>,
+    #[prost(bool, tag = "2")]
+    pub demand: bool,
+    #[prost(bool, tag = "3")]
+    pub feedback: bool,
 }
 
 impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
@@ -167,7 +205,48 @@ impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
     pub fn new(provider: T) -> Self {
         Self {
             id: Uuid::new_v4(),
+            demand: false,
+            feedback: false,
             provider: RemoteOrLocalProvider::Local(provider),
+        }
+    }
+
+    /// Request the next descriptor only when the leaf polls its feed again.
+    /// A leaf must fully consume a descriptor before polling the next one.
+    /// Providers may share one frozen queue among partitions to assign remaining
+    /// work to idle workers. Errors or lost replies fail the query; no redelivery
+    /// or independent retry authority is introduced.
+    pub fn with_demand(mut self) -> Self {
+        self.demand = true;
+        self
+    }
+
+    /// Require completion before admitting another descriptor on this
+    /// partition. A lost completion fails the query; it is never redelivered.
+    pub fn with_feedback(mut self) -> Self {
+        self.demand = true;
+        self.feedback = true;
+        self
+    }
+
+    pub fn complete(
+        &self,
+        partition: usize,
+        ctx: Arc<TaskContext>,
+        body: bytes::Bytes,
+    ) -> Result<()> {
+        if !self.feedback || body.len() > super::demand::FEEDBACK_BYTES {
+            return internal_err!("Unexpected or oversized work unit feedback");
+        }
+        match &self.provider {
+            RemoteOrLocalProvider::Local(provider) => {
+                provider.feedback(partition, ctx).ok_or_else(|| {
+                    datafusion::common::internal_datafusion_err!(
+                        "Missing work unit completion handler"
+                    )
+                })?(body)
+            }
+            RemoteOrLocalProvider::Remote(provider) => provider.complete(partition, ctx, body),
         }
     }
 
@@ -177,8 +256,13 @@ impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
     /// physical plan codecs when deserializing a plan on a worker.
     pub fn from_proto(proto: WorkUnitFeedProto) -> Result<Self> {
         let id = deserialize_uuid(&proto.id)?;
+        if proto.feedback && !proto.demand {
+            return internal_err!("Work unit completion requires a demand feed");
+        }
         Ok(WorkUnitFeed {
             id,
+            demand: proto.demand,
+            feedback: proto.feedback,
             provider: RemoteOrLocalProvider::Remote(RemoteFeedProvider {
                 id,
                 metrics: ExecutionPlanMetricsSet::new(),
@@ -193,6 +277,8 @@ impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
     pub fn to_proto(&self) -> WorkUnitFeedProto {
         WorkUnitFeedProto {
             id: serialize_uuid(&self.id),
+            demand: self.demand,
+            feedback: self.feedback,
         }
     }
 
@@ -272,7 +358,33 @@ impl<T: WorkUnitFeedProvider> WorkUnitFeed<T> {
         partition: usize,
         ctx: Arc<TaskContext>,
     ) -> Result<BoxStream<'static, Result<T::WorkUnit>>> {
-        self.provider.feed(partition, ctx)
+        use futures::{StreamExt, TryStreamExt};
+        Ok(self
+            .feed_owned(partition, ctx, |bytes| {
+                bytes
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|size| size.checked_add(512))
+                    .ok_or_else(|| {
+                        datafusion::common::internal_datafusion_err!("Work unit size overflow")
+                    })
+            })?
+            .map_ok(|value| value.into_inner())
+            .boxed())
+    }
+
+    /// Decode row-bearing work with an explicit leaf-specific allocation bound.
+    /// The bound must include all allocations performed by prost decoding this
+    /// message; compressed payload expansion is admitted separately by its codec.
+    /// Retain the returned owner through any views into its decoded value.
+    pub fn feed_owned(
+        &self,
+        partition: usize,
+        ctx: Arc<TaskContext>,
+        bound: fn(&[u8]) -> Result<usize>,
+    ) -> Result<BoxStream<'static, Result<super::remote_work_unit_feed::OwnedWorkUnit<T::WorkUnit>>>>
+    {
+        self.provider.feed(partition, ctx, self.feedback, bound)
     }
 
     /// DataFusion metrics collected at runtime while streaming [WorkUnit]s through [Self::feed].

@@ -8,7 +8,7 @@ use crate::dynamic_filtering::{
 use crate::events::{TaskFinishedHandlers, WorkerPlanRewriteEvent, WorkerPlanRewriteHandlers};
 use crate::execution_plans::SamplerExec;
 use crate::protocol::LocalWorkerContext;
-use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
+use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, Requester, set_work_unit_received_time};
 use crate::worker::task_data::TaskDataMetrics;
 use crate::{
     CoordinatorToWorkerMsg, DistributedConfig, DistributedExt, DistributedTaskContext,
@@ -30,9 +30,10 @@ use http::HeaderMap;
 #[cfg(feature = "integration")]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::mpsc::channel;
+use tokio::sync::mpsc::{channel, unbounded_channel};
 use tokio::sync::{oneshot, watch};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio_util::sync::CancellationToken;
 
 /// Return value of the [Worker::coordinator_channel] method.
 pub struct CoordinatorChannelResult {
@@ -58,15 +59,32 @@ impl Worker {
             .get_with(key, async { Default::default() })
             .await;
 
+        let has_demand = request
+            .work_unit_feed_declarations
+            .iter()
+            .any(|decl| decl.demand);
+        // Ends the worker->coordinator demand stream once every demand partition reached its EOF
+        // or the coordinator channel ended.
+        let demand_done = CancellationToken::new();
+        if !has_demand {
+            demand_done.cancel();
+        }
         let mut remote_work_unit_feed_registry = RemoteWorkUnitFeedRegistry::default();
         for decl in request.work_unit_feed_declarations {
-            remote_work_unit_feed_registry.add(decl.id, decl.partitions);
+            remote_work_unit_feed_registry.add(
+                decl.id,
+                decl.partitions,
+                decl.demand,
+                &self.runtime.memory_pool,
+            );
         }
 
+        let (demand_tx, demand_rx) = unbounded_channel();
         let (metrics_tx, metrics_rx) = oneshot::channel();
         let (dynamic_filters_tx, dynamic_filters_rx) = oneshot::channel();
         let (dynamic_filters_error_tx, dynamic_filters_error_rx) = channel(1);
 
+        let requester = has_demand.then(|| Arc::new(Requester(demand_tx)));
         let task_data = || async {
             let mut cfg = SessionConfig::default()
                 .with_extension(Arc::new(remote_work_unit_feed_registry.receivers))
@@ -79,6 +97,9 @@ impl Worker {
                     self_url: request.target_worker_url,
                 }))
                 .with_distributed_option_extension_from_headers::<DistributedConfig>(&headers)?;
+            if let Some(requester) = requester {
+                cfg = cfg.with_extension(requester);
+            }
 
             let d_cfg = DistributedConfig::from_config_options(cfg.options())?;
             let shuffle_batch_size = d_cfg.shuffle_batch_size;
@@ -132,7 +153,15 @@ impl Worker {
             .write(task_data_result.clone())
             .map_err(|e| exec_datafusion_err!("{e}"))?;
 
-        let task_data = task_data_result.map_err(DataFusionError::Shared)?;
+        // A failed setup has no channel to release its entry later; waiting readers already hold
+        // the error.
+        let task_data = match task_data_result {
+            Ok(task_data) => task_data,
+            Err(error) => {
+                self.release(key, &entry, false).await;
+                return Err(DataFusionError::Shared(error));
+            }
+        };
         let mut sampler_gate = SamplerExec::gate_for_first_sampler(
             Arc::clone(&task_data.base_plan),
             Arc::clone(&task_data.task_ctx),
@@ -175,6 +204,7 @@ impl Worker {
         //    while loop inside this `tokio::spawn` below.
         // 5. The metrics and final dynamic filters are sent back in the worker->coordinator
         //    channel, and then that channel is closed.
+        let demand_complete = demand_done.clone();
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             let mut stream = stream.map_ok(set_work_unit_received_time);
@@ -190,11 +220,23 @@ impl Worker {
                             let Some(tx) = work_unit_senders.get(&(wu.id, partition)) else {
                                 continue;
                             };
-                            if tx.send(Ok(wu)).is_err() {
-                                // Channel closed, this sender needs to be dropped, as none will ever
-                                // be listening on the other side.
-                                work_unit_senders.remove(&(id, partition));
-                                continue;
+                            if tx.credit.is_some() {
+                                let _ = dynamic_filters_error_tx.try_send(exec_datafusion_err!(
+                                    "Unsolicited eager work unit for demand feed {id}"
+                                ));
+                                break;
+                            }
+                            match tx.send(wu) {
+                                Ok(true) => {}
+                                // Channel closed, this sender needs to be dropped, as none will
+                                // ever be listening on the other side.
+                                Ok(false) => {
+                                    work_unit_senders.remove(&(id, partition));
+                                }
+                                Err(error) => {
+                                    let _ = dynamic_filters_error_tx.try_send(error);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -206,7 +248,54 @@ impl Worker {
                         // The [WorkUnitEos] message just applies work units, and it's not a global
                         // EOS signal for the coordinator->worker stream, as there might be more
                         // messages of different nature in that stream.
-                        let _ = work_unit_senders.take();
+                        //
+                        // Demand feeds end per partition with an empty WorkUnitResponse instead.
+                        if let Some(senders) = &mut work_unit_senders {
+                            senders.retain(|_, tx| tx.credit.is_some());
+                        }
+                    }
+                    CoordinatorToWorkerMsg::WorkUnitResponse(response) => {
+                        let demand = response.demand;
+                        let result = (|| {
+                            let senders = work_unit_senders
+                                .as_mut()
+                                .ok_or_else(|| exec_datafusion_err!("Missing demand senders"))?;
+                            let tx =
+                                senders.get(&(demand.id, demand.partition)).ok_or_else(|| {
+                                    exec_datafusion_err!("Undeclared work unit response")
+                                })?;
+                            let credit = tx.credit.as_ref().ok_or_else(|| {
+                                exec_datafusion_err!("Demand response for eager feed")
+                            })?;
+                            credit
+                                .lock()
+                                .map_err(|_| exec_datafusion_err!("Demand credit poisoned"))?
+                                .respond(&demand, response.unit.is_some())?;
+                            let ended = match response.unit {
+                                Some(unit) => {
+                                    if unit.id != demand.id || unit.partition != demand.partition {
+                                        return Err(exec_datafusion_err!(
+                                            "Work unit response identity mismatch"
+                                        ));
+                                    }
+                                    // A consumer that stopped polling while its demand was in
+                                    // flight will not ask again, so its partition ends here.
+                                    !tx.send(unit)?
+                                }
+                                None => true,
+                            };
+                            if ended {
+                                senders.remove(&(demand.id, demand.partition));
+                                if !senders.values().any(|tx| tx.credit.is_some()) {
+                                    demand_complete.cancel();
+                                }
+                            }
+                            Ok::<_, DataFusionError>(())
+                        })();
+                        if let Err(error) = result {
+                            let _ = dynamic_filters_error_tx.try_send(error);
+                            break;
+                        }
                     }
                     CoordinatorToWorkerMsg::KickOffSampling => {
                         sampler_gate.kick_off();
@@ -235,6 +324,17 @@ impl Worker {
                             continue;
                         }
                     }
+                }
+            }
+
+            demand_complete.cancel();
+            // A truncated channel is not a successful feed EOF. Only an explicit
+            // sequenced response may finish a demand partition.
+            if let Some(senders) = work_unit_senders {
+                for (_, tx) in senders {
+                    let _ = tx.sender.send(Err(exec_datafusion_err!(
+                        "Coordinator channel ended before work unit EOF"
+                    )));
                 }
             }
 
@@ -351,8 +451,13 @@ impl Worker {
             }));
 
         let dynamic_filters_error_stream = ReceiverStream::new(dynamic_filters_error_rx);
+        // The task context keeps the demand sender alive, so this stream ends with demand_done.
+        let demand_stream = UnboundedReceiverStream::new(demand_rx)
+            .map(Ok)
+            .take_until(demand_done.cancelled_owned());
 
         let stream = select_all([
+            demand_stream.boxed(),
             produced_dynamic_filters_stream.map(Ok).boxed(),
             load_info_stream.map(Ok).boxed(),
             metrics_stream.map(Ok).boxed(),
@@ -446,6 +551,13 @@ fn build_task_completed_dynamic_filters(
 mod tests {
     use super::*;
     use crate::TaskKey;
+    #[cfg(feature = "integration")]
+    use crate::test_utils::test_work_unit_feed::{RowGeneratorExec, RowGeneratorFeedProvider};
+    #[cfg(feature = "integration")]
+    use crate::{
+        ExecuteTaskRequest, ProducerHead, WorkUnitFeed, WorkUnitFeedDeclaration, WorkUnitMsg,
+        WorkUnitResponse,
+    };
     use datafusion::arrow::datatypes::Schema;
     use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
     use std::time::Duration;
@@ -492,5 +604,93 @@ mod tests {
         })
         .await
         .expect("completed task retained its context without cache maintenance")
+    }
+
+    // A demand partition whose consumer stops polling while its demand is in flight just ends:
+    // the late work unit has nobody to go to, and the task's channel still closes cleanly.
+    #[cfg(feature = "integration")]
+    #[tokio::test]
+    async fn dropping_a_demand_consumer_mid_request_does_not_fail_the_task() -> Result<()> {
+        let worker = Worker::default();
+        let feed = WorkUnitFeed::new(RowGeneratorFeedProvider::shared(1, 1..=1)).with_demand();
+        let plan = RowGeneratorExec::new(
+            WorkUnitFeed::from_proto(feed.to_proto())?,
+            "dropped".into(),
+            1,
+            None,
+            1,
+        );
+        let task_key = TaskKey {
+            query_id: Uuid::new_v4(),
+            stage_id: 0,
+            task_number: 0,
+        };
+        let request = SetPlanRequest {
+            task_key,
+            task_count: 1,
+            plan: MaybeEncoded::Decoded(Arc::new(plan)),
+            dynamic_filter_remote_producer_ids: vec![],
+            work_unit_feed_declarations: vec![WorkUnitFeedDeclaration {
+                id: feed.id,
+                partitions: 1,
+                demand: true,
+            }],
+            target_worker_url: Url::parse("http://worker.test").unwrap(),
+            query_start_time_ns: 0,
+        };
+        let (control, incoming) = channel(1);
+        let mut channel = worker
+            .coordinator_channel(
+                HeaderMap::new(),
+                request,
+                ReceiverStream::new(incoming).boxed(),
+            )
+            .await?;
+        let (mut partitions, _) = worker
+            .execute_task(ExecuteTaskRequest {
+                task_key,
+                target_partition_start: 0,
+                target_partition_end: 1,
+                producer_head: ProducerHead::None,
+            })
+            .await?;
+        let mut partition = partitions.remove(0);
+
+        // Polling the partition once sends its first demand, then waits for the response.
+        assert!(partition.next().now_or_never().is_none());
+        let demand = loop {
+            match channel.stream.try_next().await? {
+                Some(WorkerToCoordinatorMsg::WorkUnitDemand(demand)) => break demand,
+                Some(_) => continue,
+                None => panic!("worker channel ended without a demand"),
+            }
+        };
+        drop(partition);
+        let unit = WorkUnitMsg {
+            id: demand.id,
+            partition: demand.partition,
+            body: MaybeEncoded::Encoded(vec![]),
+            created_timestamp_unix_nanos: 0,
+            sent_timestamp_unix_nanos: 0,
+            received_timestamp_unix_nanos: 0,
+            processed_timestamp_unix_nanos: 0,
+        };
+        let response = WorkUnitResponse {
+            demand,
+            unit: Some(unit),
+        };
+        control
+            .send(Ok(CoordinatorToWorkerMsg::WorkUnitResponse(response)))
+            .await
+            .unwrap();
+        drop(control);
+
+        // Deadlock cap only.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            channel.stream.try_for_each(|_| async { Ok(()) }),
+        )
+        .await
+        .expect("worker channel did not end")
     }
 }

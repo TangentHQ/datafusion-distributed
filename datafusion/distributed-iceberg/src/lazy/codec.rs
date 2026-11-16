@@ -83,8 +83,10 @@ impl PhysicalExtensionCodec for LazyIcebergCodec {
         let feed = proto
             .feed
             .ok_or_else(|| proto_error("LazyIcebergDataSource is missing its work-unit feed"))?;
-        let feed =
-            WorkUnitFeed::<IcebergWorkUnitFeed>::from_proto(WorkUnitFeedProto { id: feed.id })?;
+        let feed = WorkUnitFeed::<IcebergWorkUnitFeed>::from_proto(WorkUnitFeedProto {
+            id: feed.id,
+            ..Default::default()
+        })?;
         let decode_ctx = PhysicalPlanDecodeContext::new(ctx, self);
         let partitioning = parse_protobuf_partitioning(
             proto.partitioning.as_ref(),

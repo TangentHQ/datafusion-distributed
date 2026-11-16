@@ -1,4 +1,7 @@
 use crate::WorkUnit;
+/// A coordinator-owned completion command, bound to one feed partition.
+/// The callback must validate its exact issued descriptor before mutation.
+pub type Feedback = Arc<dyn Fn(bytes::Bytes) -> Result<()> + Send + Sync>;
 use datafusion::common::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -82,6 +85,12 @@ pub trait WorkUnitFeedProvider: Send + Sync + Debug {
         partition: usize,
         ctx: Arc<TaskContext>,
     ) -> Result<BoxStream<'static, Result<Self::WorkUnit>>>;
+
+    /// Opt-in bounded completion feedback for demand feeds. The closure owns
+    /// the provider state and runs before the next descriptor is pulled.
+    fn feedback(&self, _partition: usize, _ctx: Arc<TaskContext>) -> Option<Feedback> {
+        None
+    }
 
     /// DataFusion metrics collected at runtime while streaming [WorkUnit]s through [Self::feed].
     fn metrics(&self) -> ExecutionPlanMetricsSet {

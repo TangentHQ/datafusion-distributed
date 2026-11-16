@@ -29,6 +29,9 @@ message CoordinatorToWorkerMsg {
     KickOffSampling kick_off_sampling = 4;
     // Sends a coordinator-merged dynamic-filter update to one consumer task.
     ApplyDynamicFilter apply_dynamic_filter = 5;
+    // The single reply to a WorkUnitDemand of a demand feed. An absent unit marks that
+    // partition's end of stream.
+    WorkUnitResponse work_unit_response = 6;
   }
 }
 
@@ -74,7 +77,30 @@ message WorkerToCoordinatorMsg {
 
     // An observed dynamic filter state produced by this task.
     ProducedDynamicFilter produced_dynamic_filter = 5;
+
+    // Asks the coordinator for the next work unit of one partition of a demand feed.
+    WorkUnitDemand work_unit_demand = 6;
   }
+}
+
+// A request for the next work unit of a demand feed partition. The task is implicit in the
+// coordinator channel carrying it.
+message WorkUnitDemand {
+  // Identifier of the node to which the work unit feed belongs to.
+  bytes id = 1;
+  // The partition index within the node.
+  uint64 partition = 2;
+  // Starts at zero and advances once per response, so duplicate or stale demands are rejected.
+  uint64 sequence = 3;
+  // Completion of the work unit returned for the previous sequence, for feeds with feedback.
+  optional bytes feedback = 4;
+}
+
+message WorkUnitResponse {
+  // The demand this message answers.
+  WorkUnitDemand demand = 1;
+  // The next work unit, or absent when the partition has no more work units.
+  WorkUnit unit = 2;
 }
 
 message DynamicFilter {
@@ -145,6 +171,9 @@ message SetPlanRequest {
     bytes id = 1;
     // The amount of partitions expected to be streamed.
     uint64 partitions = 2;
+    // Whether the worker pulls work units one at a time with WorkUnitDemand messages instead of
+    // receiving them eagerly.
+    bool demand = 3;
   }
   // Information about all the work unit feeds that will be streamed from coordinator to worker.
   // This information is needed here because at the moment of setting the plan, all the appropriate

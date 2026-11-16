@@ -13,10 +13,10 @@ use crate::dynamic_filtering::{
 use crate::events::{
     RouteTaskEvent, RouteTaskEventResponse, RouteTaskHandlers, new_coordinator_to_worker_dialer,
 };
-use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
+use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec, SamplerExec};
 use crate::passthrough_headers::get_passthrough_headers;
 use crate::stage::LocalStage;
-use crate::work_unit_feed::WorkUnitFeedRegistry;
+use crate::work_unit_feed::{Demands, WorkUnitFeedRegistry};
 use crate::work_unit_feed::{build_work_unit_batch_msg, set_work_unit_send_time};
 use crate::{
     CoordinatorToWorkerMsg, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedGetterExt,
@@ -62,6 +62,7 @@ pub(super) struct QueryCoordinator {
     completed_dynamic_filter_store: Option<Arc<Store<TaskCompletedDynamicFilters>>>,
     dynamic_filter_registry: Arc<DynamicFilterRegistry>,
     pub(super) spawner: Spawner,
+    demands: Arc<Demands>,
 }
 
 impl QueryCoordinator {
@@ -85,6 +86,7 @@ impl QueryCoordinator {
             )),
             coordinator_to_worker_metrics: CoordinatorToWorkerMetrics::new(metrics_set),
             spawner,
+            demands: Arc::default(),
         }
     }
 
@@ -103,6 +105,7 @@ impl QueryCoordinator {
             completed_dynamic_filter_store: &self.completed_dynamic_filter_store,
             dynamic_filter_registry: &self.dynamic_filter_registry,
             spawner: &self.spawner,
+            demands: &self.demands,
         }
     }
 
@@ -132,6 +135,7 @@ pub(super) struct StageCoordinator<'a> {
     completed_dynamic_filter_store: &'a Option<Arc<Store<TaskCompletedDynamicFilters>>>,
     dynamic_filter_registry: &'a Arc<DynamicFilterRegistry>,
     spawner: &'a Spawner,
+    demands: &'a Arc<Demands>,
 }
 
 impl<'a> StageCoordinator<'a> {
@@ -265,6 +269,8 @@ impl<'a> StageCoordinator<'a> {
         else {
             return internal_err!("Missing coordinator_to_worker_tx");
         };
+        self.demands
+            .sender(task_key, coordinator_to_worker_tx.clone())?;
         self.dynamic_filter_registry
             .register_sender(task_key, coordinator_to_worker_tx.clone())?;
 
@@ -294,6 +300,8 @@ impl<'a> StageCoordinator<'a> {
         let mut completed_dynamic_filter_store = self.completed_dynamic_filter_store.clone();
         let dynamic_filter_registry = Arc::clone(self.dynamic_filter_registry);
         let task_ctx = Arc::clone(self.task_ctx);
+        let demands = Arc::clone(self.demands);
+        let spawner = self.spawner.clone();
         let (load_info_tx, load_info_rx) = unbounded_channel();
         let mut load_info_tx_opt = Some(load_info_tx);
 
@@ -301,6 +309,18 @@ impl<'a> StageCoordinator<'a> {
         self.spawner.spawn_unbounded(async move {
             while let Some(msg) = worker_to_coordinator_stream.try_next().await? {
                 match msg {
+                    WorkerToCoordinatorMsg::WorkUnitDemand(demand) => {
+                        // Validate and take the credit here, in channel order; only pulling the
+                        // provider runs concurrently with the rest of this channel's messages.
+                        let request = demands.request(task_key, demand)?;
+                        let cancel = spawner.query_finished();
+                        spawner.spawn(async move {
+                            select! {
+                                result = request => result,
+                                _ = cancel.cancelled() => Ok(()),
+                            }
+                        });
+                    }
                     WorkerToCoordinatorMsg::TaskMetrics(metrics) => {
                         if let Some(task_metrics) = task_metrics.take() {
                             task_metrics.insert(task_key, metrics);
@@ -361,6 +381,10 @@ impl<'a> StageCoordinator<'a> {
             let Some(wuf) = wuf_registry.get_work_unit_feed(plan) else {
                 return Ok(TreeNodeRecursion::Continue);
             };
+            // Demand feeds are polled only when a worker asks for their next work unit.
+            if wuf.demand() {
+                return Ok(TreeNodeRecursion::Continue);
+            }
 
             let partitions = plan.properties().partitioning.partition_count();
             let start_partition = partitions * d_ctx.task_index;
@@ -441,7 +465,34 @@ impl<'a> StageCoordinator<'a> {
                 work_unit_feed_declarations.push(WorkUnitFeedDeclaration {
                     id: wuf.id(),
                     partitions: plan.properties().partitioning.partition_count(),
+                    demand: wuf.demand(),
                 });
+
+                if wuf.demand() {
+                    let partitions = plan.properties().partitioning.partition_count();
+                    let ctx = Arc::new(task_ctx_with_extension(
+                        self.task_ctx,
+                        DistributedWorkUnitFeedContext {
+                            fan_out_tasks: d_ctx.task_count,
+                        },
+                    ));
+                    let task = TaskKey {
+                        query_id: self.query_id,
+                        stage_id: self.stage_id,
+                        task_number: task_i,
+                    };
+                    for partition in 0..partitions {
+                        let feed_idx = partitions * d_ctx.task_index + partition;
+                        self.demands.add(
+                            task,
+                            wuf.id(),
+                            partition,
+                            wuf.feed(feed_idx, Arc::clone(&ctx))?,
+                            ctx.memory_pool(),
+                            wuf.feedback(feed_idx, Arc::clone(&ctx))?,
+                        )?;
+                    }
+                }
 
                 // WorkUnitFeeds are transitioned to remote mode during proto conversion.
                 // Right now, there's no other way for a WorkUnitFeed to be transitioned to
@@ -463,16 +514,18 @@ impl<'a> StageCoordinator<'a> {
                 return Ok(Transformed::yes(specialized));
             }
 
-            // Rebuild each RepartitionExec so every task gets its own instance with
-            // fresh partition state; sharing one across tasks causes a "partition not
-            // used yet" panic when the second task tries to pull from it.
-            if plan.downcast_ref::<RepartitionExec>().is_some() {
+            // Both nodes own streams consumed once. Rebuild them even when
+            // their children are unchanged: local workers receive decoded
+            // plans and need the same task isolation as the wire codec.
+            if plan.downcast_ref::<RepartitionExec>().is_some()
+                || plan.downcast_ref::<SamplerExec>().is_some()
+            {
                 let children = plan.children().into_iter().map(Arc::clone).collect();
-                let local_repartion_exec = plan.replace_children(
+                let local = plan.replace_children(
                     children,
                     ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
                 )?;
-                return Ok(Transformed::yes(local_repartion_exec));
+                return Ok(Transformed::yes(local));
             }
             // we are explicitly not retransforming the entire plan. if other operators cause shared state errors they will error out.
             Ok(Transformed::no(plan))
@@ -542,6 +595,66 @@ impl CoordinatorToWorkerMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DistributedConfig, DistributedExt};
+    use datafusion::arrow::{
+        array::{ArrayRef, Int64Array},
+        record_batch::RecordBatch,
+    };
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::execution::SessionStateBuilder;
+
+    #[tokio::test]
+    async fn local_task_samplers_replay_their_own_input() -> Result<()> {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])?;
+        for tasks in [2, 4] {
+            let source =
+                MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)?;
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(SamplerExec::new(source));
+            let ctx = SessionStateBuilder::new()
+                .with_default_features()
+                .with_distributed_option_extension(DistributedConfig::default())
+                .build()
+                .task_ctx();
+            let mut output = RecordBatchReceiverStreamBuilder::new(plan.schema(), 2);
+            let coordinator = QueryCoordinator::new(
+                ctx.clone(),
+                &ExecutionPlanMetricsSet::new(),
+                None,
+                None,
+                &mut output,
+            );
+            let stage = LocalStage {
+                query_id: Uuid::new_v4(),
+                num: 1,
+                plan,
+                tasks,
+                metrics_set: Default::default(),
+            };
+            let channel = coordinator.stage_coordinator(&stage);
+            let mut plans = Vec::new();
+            let mut gates = Vec::new();
+            // Admit all tasks before consuming any, as a local worker does.
+            for task in 0..tasks {
+                let plan = channel.task_specialized_plan(task)?.plan;
+                let gate = SamplerExec::gate_for_first_sampler(plan.clone(), ctx.clone())?;
+                gate.kick_off();
+                plans.push(plan);
+                gates.push(gate);
+            }
+            for plan in plans {
+                let actual = plan
+                    .execute(0, ctx.clone())?
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                assert_eq!(actual, vec![batch.clone()]);
+            }
+            drop(gates);
+        }
+        Ok(())
+    }
 
     /// Regression test for a rustc miscompilation (present at least through
     /// 1.96, fixed in 1.98) of [`CoordinatorToWorkerMetrics::new`].
@@ -607,5 +720,167 @@ mod tests {
                  — rustc metric-builder miscompilation (use a named fn, not a closure)"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "integration"))]
+mod feed_tests {
+    use super::*;
+    use crate::test_utils::test_work_unit_feed::{
+        RowGeneratorExec, RowGeneratorFeedProvider, RowGeneratorWorkUnit, TestWorkUnitFeedExecCodec,
+    };
+    use crate::{DistributedConfig, DistributedExt, WorkUnitDemand, WorkUnitFeed, WorkUnitMsg};
+    use datafusion::common::exec_datafusion_err;
+    use datafusion::execution::SessionStateBuilder;
+    use prost::Message;
+    use std::time::Duration;
+
+    // Both tasks read one shared queue of descriptors 1..=4. Eagerly, each task's feed is
+    // drained into its coordinator channel as soon as it is spawned, so the first task takes
+    // every descriptor and the second one gets only its WorkUnitEos.
+    #[tokio::test]
+    async fn eager_feed_delivers_every_descriptor_once_across_tasks() -> Result<()> {
+        let feed = WorkUnitFeed::new(RowGeneratorFeedProvider::shared(2, 1..=4));
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(RowGeneratorExec::new(feed, "shared".into(), 1, None, 4));
+        let ctx = SessionStateBuilder::new()
+            .with_default_features()
+            .with_distributed_option_extension(DistributedConfig::default())
+            .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+            .with_distributed_work_unit_feed(|scan: &RowGeneratorExec| Some(&scan.feed))
+            .build()
+            .task_ctx();
+        let mut output = RecordBatchReceiverStreamBuilder::new(plan.schema(), 2);
+        let coordinator = QueryCoordinator::new(
+            ctx,
+            &ExecutionPlanMetricsSet::new(),
+            None,
+            None,
+            &mut output,
+        );
+        let stage = LocalStage {
+            query_id: Uuid::new_v4(),
+            num: 1,
+            plan,
+            tasks: 2,
+            metrics_set: Default::default(),
+        };
+        let mut channel = coordinator.stage_coordinator(&stage);
+
+        let mut delivered = vec![];
+        for task in 0..2 {
+            let declarations = channel
+                .task_specialized_plan(task)?
+                .work_unit_feed_declarations;
+            assert_eq!(declarations.len(), 1);
+            assert!(!declarations[0].demand);
+
+            let (tx, mut rx) = unbounded_channel();
+            channel.coordinator_to_worker_task(task, tx)?;
+            let mut identities = vec![];
+            loop {
+                // Deadlock cap only.
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .expect("eager feed deadlocked")
+                {
+                    Some(CoordinatorToWorkerMsg::WorkUnitBatch(batch)) => {
+                        for unit in batch.batch {
+                            identities.push(identity(unit)?);
+                        }
+                    }
+                    Some(CoordinatorToWorkerMsg::WorkUnitEos) => break,
+                    _ => panic!("eager feed ended without WorkUnitEos"),
+                }
+            }
+            delivered.push(identities);
+        }
+        assert_eq!(delivered, vec![vec![1, 2, 3, 4], vec![]]);
+        Ok(())
+    }
+
+    // Both tasks read one shared queue of descriptors 1..=4, and ask for work in turns. A demand
+    // feed polls the provider only when a task asks, so each request takes the next unread
+    // descriptor: the tasks split the queue, and both see an explicit EOF once it is empty.
+    #[tokio::test]
+    async fn demand_feed_delivers_every_descriptor_once_across_tasks() -> Result<()> {
+        let feed = WorkUnitFeed::new(RowGeneratorFeedProvider::shared(2, 1..=4)).with_demand();
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(RowGeneratorExec::new(feed, "shared".into(), 1, None, 4));
+        let ctx = SessionStateBuilder::new()
+            .with_default_features()
+            .with_distributed_option_extension(DistributedConfig::default())
+            .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+            .with_distributed_work_unit_feed(|scan: &RowGeneratorExec| Some(&scan.feed))
+            .build()
+            .task_ctx();
+        let mut output = RecordBatchReceiverStreamBuilder::new(plan.schema(), 2);
+        let coordinator = QueryCoordinator::new(
+            ctx,
+            &ExecutionPlanMetricsSet::new(),
+            None,
+            None,
+            &mut output,
+        );
+        let stage = LocalStage {
+            query_id: Uuid::new_v4(),
+            num: 1,
+            plan,
+            tasks: 2,
+            metrics_set: Default::default(),
+        };
+        let channel = coordinator.stage_coordinator(&stage);
+
+        let mut tasks = vec![];
+        for task in 0..2 {
+            let declarations = channel
+                .task_specialized_plan(task)?
+                .work_unit_feed_declarations;
+            assert_eq!(declarations.len(), 1);
+            assert!(declarations[0].demand);
+            let key = TaskKey {
+                query_id: stage.query_id,
+                stage_id: stage.num,
+                task_number: task,
+            };
+            let (tx, rx) = unbounded_channel();
+            coordinator.demands.sender(key, tx)?;
+            tasks.push((key, declarations[0].id, rx));
+        }
+
+        let mut delivered = vec![vec![]; 2];
+        let mut ended = [false; 2];
+        for sequence in 0..3 {
+            for (task, (key, id, rx)) in tasks.iter_mut().enumerate() {
+                let demand = WorkUnitDemand {
+                    id: *id,
+                    partition: 0,
+                    sequence,
+                    feedback: None,
+                };
+                coordinator.demands.request(*key, demand)?.await?;
+                let Some(CoordinatorToWorkerMsg::WorkUnitResponse(response)) = rx.recv().await
+                else {
+                    panic!("demand got no WorkUnitResponse");
+                };
+                match response.unit {
+                    Some(unit) => delivered[task].push(identity(unit)?),
+                    None => ended[task] = true,
+                }
+            }
+        }
+        assert_eq!(delivered, vec![vec![1, 3], vec![2, 4]]);
+        assert_eq!(ended, [true, true]);
+        Ok(())
+    }
+
+    fn identity(unit: WorkUnitMsg) -> Result<u64> {
+        let bytes = match unit.body {
+            MaybeEncoded::Decoded(value) => value.encode_to_bytes(),
+            MaybeEncoded::Encoded(bytes) => bytes,
+        };
+        let unit = RowGeneratorWorkUnit::decode(bytes.as_slice())
+            .map_err(|error| exec_datafusion_err!("{error}"))?;
+        Ok(unit.identity)
     }
 }
