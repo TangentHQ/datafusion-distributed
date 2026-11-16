@@ -125,15 +125,26 @@ pub struct NetworkBroadcastExec {
 }
 
 impl NetworkBroadcastExec {
-    pub(crate) fn from_stage(input_stage: Stage, input_properties: Arc<PlanProperties>) -> Self {
-        let input_partition_count = input_properties.partitioning.partition_count();
-        let properties = Arc::new(
-            PlanProperties::clone(&input_properties)
-                .with_partitioning(Partitioning::UnknownPartitioning(input_partition_count)),
-        );
+    /// Computes the properties advertised by this [NetworkBroadcastExec].
+    ///
+    /// Each output partition interleaves the same partition from every producer task, so
+    /// orderings and partition-local constants only survive a single producer task.
+    fn compute_properties(input_properties: &PlanProperties, tasks: usize) -> Arc<PlanProperties> {
+        let partitions = input_properties.partitioning.partition_count();
+        let properties = PlanProperties::clone(input_properties)
+            .with_partitioning(Partitioning::UnknownPartitioning(partitions));
+        if tasks <= 1 {
+            return Arc::new(properties);
+        }
+        let mut eq_properties = properties.eq_properties.clone();
+        eq_properties.clear_orderings();
+        eq_properties.clear_per_partition_constants();
+        Arc::new(properties.with_eq_properties(eq_properties))
+    }
 
+    pub(crate) fn from_stage(input_stage: Stage, input_properties: Arc<PlanProperties>) -> Self {
         Self {
-            properties,
+            properties: Self::compute_properties(&input_properties, input_stage.task_count()),
             worker_connections: WorkerConnectionPool::new(input_stage.task_count()),
             input_stage,
         }
@@ -167,6 +178,8 @@ impl NetworkBoundary for NetworkBroadcastExec {
     fn with_input_stage(&self, input_stage: Stage) -> Result<Arc<dyn NetworkBoundary>> {
         let mut self_clone = self.clone();
         self_clone.worker_connections = WorkerConnectionPool::new(input_stage.task_count());
+        self_clone.properties =
+            Self::compute_properties(&self.properties, input_stage.task_count());
         self_clone.input_stage = input_stage;
         Ok(Arc::new(self_clone))
     }

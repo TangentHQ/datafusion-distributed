@@ -16,10 +16,12 @@ into account:
 
 ### No topology modifications inside [inject_network_boundaries.rs](./inject_network_boundaries.rs)
 
-The `inject_network_boundaries` should only be in charge of injecting 
-network boundaries, it should never change the shape or topology of the plan,
-and it should never perform replacement of some nodes by their distributed
-variants.
+The `inject_network_boundaries` should only be in charge of injecting
+network boundaries, and it should never perform replacement of some nodes by
+their distributed variants. Its only other change to the plan's shape is the
+one task counts force: where a stage can run in several tasks, it adds the
+exchanges, merges and sorts that keep each node's required input distribution
+and ordering true across those tasks, built from DataFusion's own operators.
 
 Any plan that reaches here should be a valid executable single-node plan.
 
