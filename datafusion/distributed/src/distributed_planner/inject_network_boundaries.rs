@@ -153,8 +153,9 @@ use uuid::Uuid;
 ///
 /// - `SinglePartition`: a replicated broadcast build side already does. Anything else is gathered
 ///   behind a [NetworkCoalesceExec], merged locally when that exposes several partitions.
-/// - Key partitioning: only a hash exchange keeps keys apart across tasks, so any other child
-///   gets a hash [RepartitionExec] that becomes a [NetworkShuffleExec].
+/// - Key partitioning: a hash exchange keeps keys apart across tasks, and so does a source's
+///   hash or range partitioning, whose scale-up handler assigns each task whole partitions. Any
+///   other child gets a hash [RepartitionExec] that becomes a [NetworkShuffleExec].
 ///
 /// Boundaries advertise only the orderings and constants that survive all their producer tasks.
 /// After rebuilding a node over its processed children, any child whose required ordering no
@@ -459,10 +460,11 @@ async fn distribute(
             Distribution::SinglePartition if replicated(child) => continue,
             Distribution::SinglePartition => gather(Arc::clone(child), nb_ctx).await?,
             keyed => {
-                // Only a hash exchange keeps keys apart across tasks. Any other partitioning,
-                // including a single partition, holds within one task.
+                // A key partitioning keeps keys apart across tasks: a hash exchange does, and a
+                // source's scale-up handler gives each task whole partitions. Any other
+                // partitioning, including a single partition, holds within one task.
                 let partitioning = child.output_partitioning();
-                if matches!(partitioning, Partitioning::Hash(_, _))
+                if matches!(partitioning, Partitioning::Hash(..) | Partitioning::Range(_))
                     && partitioning
                         .satisfaction(&keyed, child.equivalence_properties(), subset)
                         .is_satisfied()
