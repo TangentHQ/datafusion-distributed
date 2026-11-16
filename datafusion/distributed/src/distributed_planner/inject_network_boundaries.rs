@@ -464,7 +464,11 @@ async fn distribute(
                 // source's scale-up handler gives each task whole partitions. Any other
                 // partitioning, including a single partition, holds within one task.
                 let partitioning = child.output_partitioning();
-                if matches!(partitioning, Partitioning::Hash(..) | Partitioning::Range(_))
+                let apart = matches!(
+                    partitioning,
+                    Partitioning::Hash(..) | Partitioning::Range(_)
+                );
+                if apart
                     && partitioning
                         .satisfaction(&keyed, child.equivalence_properties(), subset)
                         .is_satisfied()
