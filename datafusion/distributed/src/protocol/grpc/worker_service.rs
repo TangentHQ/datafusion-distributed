@@ -164,10 +164,11 @@ impl pb::worker_service_server::WorkerService for Worker {
                 "Unknown compression type {v}"
             )))?,
         };
+        let size = self.max_message_size.unwrap_or(usize::MAX);
         let mut flight_streams = Vec::with_capacity(arrow_streams.len());
         for (partition, arrow_stream) in partition_range.zip(arrow_streams) {
             let flight_stream =
-                build_flight_data_stream(arrow_stream, compression)?.map(move |msg| {
+                build_flight_data_stream(arrow_stream, compression, size)?.map(move |msg| {
                     // For each FlightData produced by this stream, mark it with the appropriate
                     // partition. This stream will be merged with several others from other partitions,
                     // so marking it with the original partition allows it to be deconstructed into
@@ -436,6 +437,7 @@ fn missing(field: &'static str) -> impl FnOnce() -> Status {
 fn build_flight_data_stream(
     stream: SendableRecordBatchStream,
     compression_type: Option<CompressionType>,
+    max_flight_data_size: usize,
 ) -> datafusion::common::Result<FlightDataEncoder, Status> {
     let stream = FlightDataEncoderBuilder::new()
         .with_options(
@@ -453,15 +455,14 @@ fn build_flight_data_stream(
         // Note that we do garbage collection of unused dictionary values above, so we are not sending
         // unused dictionary values over the wire.
         .with_dictionary_handling(DictionaryHandling::Resend)
-        // Set max flight data size to unlimited.
-        // This requires servers and clients to also be configured to handle unlimited sizes.
-        // Using unlimited sizes avoids splitting RecordBatches into multiple FlightData messages,
-        // which could add significant overhead for large RecordBatches.
+        // Set by Worker::with_max_message_size, unlimited by default.
+        // Unlimited sizes require servers and clients to also be configured to handle them.
+        // They avoid splitting RecordBatches into multiple FlightData messages, which could add
+        // significant overhead for large RecordBatches.
         // The only reason to split them really is if the client/server are configured with a message size limit,
         // which mainly makes sense in a public network scenario where you want to avoid DoS attacks.
-        // Since all of our Arrow Flight communication happens within trusted data plane networks,
-        // we can safely use unlimited sizes here.
-        .with_max_flight_data_size(usize::MAX)
+        // This is a fragmentation target, not a hard limit: one wide value may still exceed it.
+        .with_max_flight_data_size(max_flight_data_size.max(1))
         .build(
             stream
                 // Apply garbage collection of dictionary and view arrays before sending over the network
@@ -525,8 +526,87 @@ fn check_task_key_headers(metadata: &MetadataMap, task_key: &TaskKey) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::serialize_uuid;
+    use arrow_flight::decode::FlightRecordBatchStream;
+    use datafusion::arrow::array::{ArrayRef, Int64Array};
+    use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_expr::expressions::lit;
     use datafusion::prelude::SessionContext;
+    use http::HeaderMap;
+    use pb::worker_service_server::WorkerService;
+    use tokio::sync::mpsc::channel;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    // A batch eight times larger than the worker's message size reaches the client as several
+    // FlightData messages, and decodes back to the same rows.
+    #[tokio::test]
+    async fn execute_task_splits_batches_at_the_worker_message_size() {
+        let worker = Worker::default().with_max_message_size(1024);
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from_iter_values(0..1024)) as ArrayRef,
+        )])
+        .unwrap();
+        let plan =
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None).unwrap();
+        let task_key = TaskKey {
+            query_id: uuid::Uuid::new_v4(),
+            stage_id: 1,
+            task_number: 0,
+        };
+        let (_control, incoming) = channel(1);
+        let _channel = worker
+            .coordinator_channel(
+                HeaderMap::new(),
+                SetPlanRequest {
+                    task_key,
+                    task_count: 1,
+                    plan: MaybeEncoded::Decoded(plan),
+                    dynamic_filter_remote_producer_ids: vec![],
+                    work_unit_feed_declarations: vec![],
+                    target_worker_url: Url::parse("http://worker.test").unwrap(),
+                    query_start_time_ns: 0,
+                },
+                ReceiverStream::new(incoming).boxed(),
+            )
+            .await
+            .unwrap();
+
+        let request = Request::new(pb::ExecuteTaskRequest {
+            task_key: Some(pb::TaskKey {
+                query_id: serialize_uuid(&task_key.query_id),
+                stage_id: 1,
+                task_number: 0,
+            }),
+            target_partition_start: 0,
+            target_partition_end: 1,
+            producer_head: Some(pb::execute_task_request::ProducerHead::None(
+                pb::NoneHead {},
+            )),
+        });
+        let messages: Vec<FlightData> = WorkerService::execute_task(&worker, request)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let data_messages = messages
+            .iter()
+            .filter(|message| !message.data_body.is_empty())
+            .count();
+        assert!(data_messages > 1, "got {data_messages} data messages");
+        let decoded: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+            futures::stream::iter(messages.into_iter().map(Ok)),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        let decoded =
+            datafusion::arrow::compute::concat_batches(&batch.schema(), &decoded).unwrap();
+        assert_eq!(decoded, batch);
+    }
 
     #[test]
     fn encode_produced_dynamic_filter() {
