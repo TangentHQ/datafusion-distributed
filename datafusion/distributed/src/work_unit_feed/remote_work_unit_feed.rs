@@ -4,7 +4,7 @@ use crate::{
     BytesMetricExt, CoordinatorToWorkerMsg, LatencyMetricExt, MaybeEncoded, WorkUnit,
     WorkUnitBatch, WorkUnitMsg,
 };
-use datafusion::common::{HashMap, Result, exec_err, internal_datafusion_err};
+use datafusion::common::{HashMap, Result, exec_datafusion_err, exec_err, internal_datafusion_err};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_expr_common::metrics::MetricBuilder;
@@ -291,11 +291,16 @@ impl RemoteFeedProvider {
                             .lock()
                             .map_err(|_| internal_datafusion_err!("Work unit credit is poisoned"))?
                             .request(id, partition)?;
+                        // The demand channel closes when the coordinator ends this task's
+                        // channel, for example because it ended the query early. That is the
+                        // end of this task, not a bug.
                         requester
                             .0
                             .send(crate::WorkerToCoordinatorMsg::WorkUnitDemand(demand))
                             .map_err(|_| {
-                                internal_datafusion_err!("Work unit demand channel closed")
+                                exec_datafusion_err!(
+                                    "The coordinator ended this task before its next work unit"
+                                )
                             })?;
                         match receiver.recv().await {
                             Some(result) => Ok(Some((result?, receiver))),
@@ -408,6 +413,7 @@ impl RemoteFeedProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::DataFusionError;
     use datafusion::execution::{
         context::SessionContext, memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder,
     };
@@ -426,6 +432,39 @@ mod tests {
             .len()
             .checked_add(128)
             .ok_or_else(|| internal_datafusion_err!("piece too large"))
+    }
+
+    // Once the coordinator ends a task's channel, its next demand cannot be sent. That ends the
+    // task like any cancellation: an execution error, not an internal one.
+    #[tokio::test]
+    async fn closed_demand_channel_ends_the_feed_with_an_execution_error() -> Result<()> {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool.clone())
+            .build_arc()?;
+        let id = Uuid::new_v4();
+        let mut registry = RemoteWorkUnitFeedRegistry::default();
+        registry.add(id, 1, true, &pool);
+        let (demands, coordinator) = tokio::sync::mpsc::unbounded_channel();
+        drop(coordinator);
+        let config = SessionConfig::new()
+            .with_extension(Arc::new(registry.receivers))
+            .with_extension(Arc::new(Requester(demands)));
+        let ctx = SessionContext::new_with_config_rt(config, runtime).task_ctx();
+        let provider = RemoteFeedProvider {
+            id,
+            metrics: ExecutionPlanMetricsSet::new(),
+        };
+
+        let result = provider
+            .feed::<Piece>(0, ctx, false, bound)?
+            .try_next()
+            .await;
+        let Err(error) = result else {
+            panic!("a closed demand channel still produced a work unit");
+        };
+        assert!(matches!(error, DataFusionError::Execution(_)), "{error:?}");
+        Ok(())
     }
 
     // Advancing or dropping the feed cannot release the prior piece's bytes.

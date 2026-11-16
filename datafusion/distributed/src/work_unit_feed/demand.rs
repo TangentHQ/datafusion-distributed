@@ -2,7 +2,7 @@
 //! is never retried here: channel loss belongs to the enclosing query attempt.
 use crate::work_unit_feed::build_work_unit_batch_msg;
 use crate::{CoordinatorToWorkerMsg, MaybeEncoded, TaskKey, WorkUnitDemand, WorkUnitResponse};
-use datafusion::common::{HashMap, Result, exec_err, internal_datafusion_err};
+use datafusion::common::{HashMap, Result, exec_datafusion_err, exec_err, internal_datafusion_err};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use futures::{StreamExt, stream::BoxStream};
 use std::sync::{Arc, Mutex};
@@ -167,7 +167,9 @@ impl Demands {
                 demand,
                 unit,
             }))
-            .map_err(|_| internal_datafusion_err!("Demand response channel closed for {task:?}"))
+            .map_err(|_| {
+                exec_datafusion_err!("Task {task:?} ended before it received its next work unit")
+            })
         })
     }
 }

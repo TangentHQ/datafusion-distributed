@@ -271,24 +271,23 @@ impl Worker {
                                 .lock()
                                 .map_err(|_| exec_datafusion_err!("Demand credit poisoned"))?
                                 .respond(&demand, response.unit.is_some())?;
-                            match response.unit {
+                            let ended = match response.unit {
                                 Some(unit) => {
                                     if unit.id != demand.id || unit.partition != demand.partition {
                                         return Err(exec_datafusion_err!(
                                             "Work unit response identity mismatch"
                                         ));
                                     }
-                                    if !tx.send(unit)? {
-                                        return Err(internal_datafusion_err!(
-                                            "Work unit receiver closed"
-                                        ));
-                                    }
+                                    // A consumer that stopped polling while its demand was in
+                                    // flight will not ask again, so its partition ends here.
+                                    !tx.send(unit)?
                                 }
-                                None => {
-                                    senders.remove(&(demand.id, demand.partition));
-                                    if !senders.values().any(|tx| tx.credit.is_some()) {
-                                        demand_complete.cancel();
-                                    }
+                                None => true,
+                            };
+                            if ended {
+                                senders.remove(&(demand.id, demand.partition));
+                                if !senders.values().any(|tx| tx.credit.is_some()) {
+                                    demand_complete.cancel();
                                 }
                             }
                             Ok::<_, DataFusionError>(())
@@ -552,6 +551,13 @@ fn build_task_completed_dynamic_filters(
 mod tests {
     use super::*;
     use crate::TaskKey;
+    #[cfg(feature = "integration")]
+    use crate::test_utils::test_work_unit_feed::{RowGeneratorExec, RowGeneratorFeedProvider};
+    #[cfg(feature = "integration")]
+    use crate::{
+        ExecuteTaskRequest, ProducerHead, WorkUnitFeed, WorkUnitFeedDeclaration, WorkUnitMsg,
+        WorkUnitResponse,
+    };
     use datafusion::arrow::datatypes::Schema;
     use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
     use std::time::Duration;
@@ -598,5 +604,93 @@ mod tests {
         })
         .await
         .expect("completed task retained its context without cache maintenance")
+    }
+
+    // A demand partition whose consumer stops polling while its demand is in flight just ends:
+    // the late work unit has nobody to go to, and the task's channel still closes cleanly.
+    #[cfg(feature = "integration")]
+    #[tokio::test]
+    async fn dropping_a_demand_consumer_mid_request_does_not_fail_the_task() -> Result<()> {
+        let worker = Worker::default();
+        let feed = WorkUnitFeed::new(RowGeneratorFeedProvider::shared(1, 1..=1)).with_demand();
+        let plan = RowGeneratorExec::new(
+            WorkUnitFeed::from_proto(feed.to_proto())?,
+            "dropped".into(),
+            1,
+            None,
+            1,
+        );
+        let task_key = TaskKey {
+            query_id: Uuid::new_v4(),
+            stage_id: 0,
+            task_number: 0,
+        };
+        let request = SetPlanRequest {
+            task_key,
+            task_count: 1,
+            plan: MaybeEncoded::Decoded(Arc::new(plan)),
+            dynamic_filter_remote_producer_ids: vec![],
+            work_unit_feed_declarations: vec![WorkUnitFeedDeclaration {
+                id: feed.id,
+                partitions: 1,
+                demand: true,
+            }],
+            target_worker_url: Url::parse("http://worker.test").unwrap(),
+            query_start_time_ns: 0,
+        };
+        let (control, incoming) = channel(1);
+        let mut channel = worker
+            .coordinator_channel(
+                HeaderMap::new(),
+                request,
+                ReceiverStream::new(incoming).boxed(),
+            )
+            .await?;
+        let (mut partitions, _) = worker
+            .execute_task(ExecuteTaskRequest {
+                task_key,
+                target_partition_start: 0,
+                target_partition_end: 1,
+                producer_head: ProducerHead::None,
+            })
+            .await?;
+        let mut partition = partitions.remove(0);
+
+        // Polling the partition once sends its first demand, then waits for the response.
+        assert!(partition.next().now_or_never().is_none());
+        let demand = loop {
+            match channel.stream.try_next().await? {
+                Some(WorkerToCoordinatorMsg::WorkUnitDemand(demand)) => break demand,
+                Some(_) => continue,
+                None => panic!("worker channel ended without a demand"),
+            }
+        };
+        drop(partition);
+        let unit = WorkUnitMsg {
+            id: demand.id,
+            partition: demand.partition,
+            body: MaybeEncoded::Encoded(vec![]),
+            created_timestamp_unix_nanos: 0,
+            sent_timestamp_unix_nanos: 0,
+            received_timestamp_unix_nanos: 0,
+            processed_timestamp_unix_nanos: 0,
+        };
+        let response = WorkUnitResponse {
+            demand,
+            unit: Some(unit),
+        };
+        control
+            .send(Ok(CoordinatorToWorkerMsg::WorkUnitResponse(response)))
+            .await
+            .unwrap();
+        drop(control);
+
+        // Deadlock cap only.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            channel.stream.try_for_each(|_| async { Ok(()) }),
+        )
+        .await
+        .expect("worker channel did not end")
     }
 }
