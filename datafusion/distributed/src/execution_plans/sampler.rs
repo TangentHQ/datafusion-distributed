@@ -714,7 +714,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let source =
-            MemorySourceConfig::try_new_exec(&[batches.clone()], batches[0].schema(), None)
+            MemorySourceConfig::try_new_exec(std::slice::from_ref(&batches), batches[0].schema(), None)
                 .unwrap();
         let plan: Arc<dyn ExecutionPlan> = Arc::new(SamplerExec::new(source));
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(128 * 1024));
