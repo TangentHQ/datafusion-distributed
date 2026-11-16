@@ -1038,3 +1038,442 @@ mod tests {
         ");
     }
 }
+
+/// Distributed results checked against native single-node SQL over the same in-memory
+/// generators, for plans whose requirements DataFusion only enforced within one task.
+#[cfg(test)]
+mod task_requirement_tests {
+    use super::create_distributed_plan;
+    use crate::test_utils::{
+        in_memory_channel_resolver::{InMemoryChannelResolver, InMemoryWorkerResolver},
+        test_work_unit_feed::{
+            RowGeneratorExec, RowGeneratorFeedProvider, TestWorkUnitFeedExecCodec,
+            TestWorkUnitFeedFunction, WorkUnitOp, row_generator_desired_task_count_handler,
+            row_generator_scale_up_leaf_node_handler,
+        },
+    };
+    use crate::{
+        DistributedConfig, DistributedExec, DistributedExt, NetworkBoundaryExt,
+        SessionStateBuilderExt, WorkUnitFeed, WorkerQueryContext,
+    };
+    use datafusion::{
+        arrow::{
+            array::{Int64Array, StringArray},
+            compute::SortOptions,
+            datatypes::{DataType, Field, SchemaRef},
+            record_batch::RecordBatch,
+            util::pretty::pretty_format_batches,
+        },
+        catalog::{Session, TableProvider},
+        common::{
+            Result, ScalarValue,
+            tree_node::{TreeNode, TreeNodeRecursion},
+        },
+        datasource::{MemTable, TableType},
+        execution::SessionStateBuilder,
+        functions_window::row_number::row_number_udwf,
+        logical_expr::{
+            Expr, Operator, WindowFrame, WindowFrameBound, WindowFrameUnits,
+            WindowFunctionDefinition,
+        },
+        physical_expr::{
+            PhysicalExpr, PhysicalSortExpr,
+            expressions::{BinaryExpr, CastExpr, Column, Literal},
+        },
+        physical_optimizer::{PhysicalOptimizerRule, ensure_requirements::EnsureRequirements},
+        physical_plan::{
+            ExecutionPlan, InputOrderMode, collect,
+            filter::FilterExec,
+            joins::CrossJoinExec,
+            projection::ProjectionExec,
+            windows::{BoundedWindowAggExec, create_window_expr},
+        },
+        physical_planner::DefaultPhysicalPlanner,
+        prelude::{SessionConfig, SessionContext},
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A native one-partition plan may legitimately omit coalesces and hash repartitions.
+    /// Scaling its leaf must restore those requirements across tasks, and the head must
+    /// consume every task rather than the first.
+    #[tokio::test]
+    async fn scaled_single_partition_queries_match_native_sql() -> Result<()> {
+        for dynamic in [false, true] {
+            let leaf = Arc::new(RowGeneratorExec::new(
+                WorkUnitFeed::new(RowGeneratorFeedProvider::new(
+                    2,
+                    vec![vec![WorkUnitOp::Rows(4)], vec![WorkUnitOp::Rows(4)]],
+                )),
+                "input".into(),
+                1,
+                None,
+                8,
+            )) as Arc<dyn ExecutionPlan>;
+            // The generator stamps each row with its task, so the native table spells out both.
+            let batch = RecordBatch::try_new(
+                leaf.schema(),
+                vec![
+                    Arc::new(StringArray::from(vec!["input"; 8])),
+                    Arc::new(Int64Array::from(vec![0, 0, 0, 0, 1, 1, 1, 1])),
+                    Arc::new(Int64Array::from(vec![0; 8])),
+                    Arc::new(StringArray::from(vec![
+                        "a", "b", "c", "d", "a", "b", "c", "d",
+                    ])),
+                ],
+            )?;
+            let native = native(1);
+            native.register_table(
+                "input",
+                Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?),
+            )?;
+            let ctx = distributed(1, 2, dynamic);
+            ctx.register_table("input", Arc::new(Input(leaf)))?;
+            for (sql, ordered) in [
+                ("SELECT task, letter FROM input", false),
+                ("SELECT task, letter FROM input ORDER BY task, letter", true),
+                ("SELECT COUNT(DISTINCT task) AS c FROM input", true),
+                ("SELECT task FROM input ORDER BY task DESC LIMIT 3", true),
+                (
+                    "SELECT letter, COUNT(*) AS c FROM input GROUP BY letter ORDER BY letter",
+                    true,
+                ),
+                (
+                    "SELECT ROW_NUMBER() OVER (ORDER BY task, letter) AS n FROM input ORDER BY n",
+                    true,
+                ),
+                (
+                    "SELECT letter, COUNT(*) OVER (PARTITION BY letter) AS n FROM input \
+                     ORDER BY letter, n",
+                    true,
+                ),
+            ] {
+                let tasks = assert_native(&ctx, &native, sql, ordered, dynamic).await?;
+                assert_eq!(
+                    tasks, 2,
+                    "dynamic={dynamic}; the leaf must scale to both tasks"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Each isolated child of a UNION ALL of literal projections runs in its own task with its
+    /// own constant. Rows shuffled out of those tasks no longer share it, so the sorts above
+    /// the shuffle must still order them (#5891).
+    #[tokio::test]
+    async fn union_constants_do_not_survive_a_shuffle() -> Result<()> {
+        let union = "SELECT 'a' AS x, letter FROM test_work_unit('a', 1, 'rows(2)') \
+            UNION ALL SELECT 'b' AS x, letter FROM test_work_unit('b', 1, 'rows(3)') \
+            UNION ALL SELECT 'c' AS x, letter FROM test_work_unit('c', 1, 'rows(4)')";
+        for dynamic in [false, true] {
+            let ctx = distributed(2, 3, dynamic);
+            for sql in [
+                format!("SELECT x, COUNT(letter) AS c FROM ({union}) GROUP BY x ORDER BY x DESC"),
+                format!(
+                    "SELECT x, c, ROW_NUMBER() OVER (ORDER BY x DESC) AS n \
+                     FROM (SELECT x, COUNT(letter) AS c FROM ({union}) GROUP BY x) ORDER BY x DESC"
+                ),
+            ] {
+                let tasks = assert_native(&ctx, &native(2), &sql, true, dynamic).await?;
+                assert!(tasks >= 2, "dynamic={dynamic}; the union must span tasks");
+            }
+        }
+        Ok(())
+    }
+
+    /// A broadcast build side is already complete in every consumer task, whether or not it
+    /// needed a local coalesce. Gathering it across tasks would repeat every match.
+    #[tokio::test]
+    async fn broadcast_joins_over_unions_match_native_sql() -> Result<()> {
+        let union = |tasks: usize| {
+            let ops = vec!["'rows(3)'"; tasks].join(", ");
+            format!(
+                "SELECT 'a' AS x, letter FROM test_work_unit('ua', {tasks}, {ops}) \
+                 UNION ALL SELECT 'b' AS x, letter FROM test_work_unit('ub', {tasks}, {ops})"
+            )
+        };
+        let queries = [
+            // A union build side has several partitions, so the broadcast is coalesced.
+            format!(
+                "SELECT b.x, p.letter FROM ({}) b \
+                 JOIN test_work_unit('p', 2, 'rows(4)', 'rows(4)') p ON b.letter = p.letter \
+                 ORDER BY b.x, p.letter",
+                union(1)
+            ),
+            // A single-partition build side is broadcast as is to a union probe side.
+            format!(
+                "SELECT p.x, b.letter FROM test_work_unit('b', 1, 'rows(2)') b \
+                 JOIN ({}) p ON b.letter = p.letter ORDER BY p.x, b.letter",
+                union(2)
+            ),
+        ];
+        for partitions in [1, 2] {
+            for dynamic in [false, true] {
+                let ctx = distributed(partitions, 3, dynamic);
+                for sql in &queries {
+                    let tasks =
+                        assert_native(&ctx, &native(partitions), sql, true, dynamic).await?;
+                    assert!(
+                        tasks >= 2,
+                        "dynamic={dynamic}; the probe side must span tasks"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A window planned against a build-side constant that only holds within one partition must
+    /// be re-sorted once a broadcast from several tasks stops advertising that constant.
+    #[tokio::test]
+    async fn window_is_resorted_when_a_broadcast_drops_its_constant() -> Result<()> {
+        // Two tasks each generate one build row and the probe letters a, b and c.
+        let mut expected = ["c", "b", "a"]
+            .iter()
+            .enumerate()
+            .flat_map(|(group, letter)| {
+                (1..=4).map(move |n| {
+                    vec![
+                        "a".to_string(),
+                        letter.to_string(),
+                        (group * 4 + n).to_string(),
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        for dynamic in [false, true] {
+            let ctx = distributed(1, 2, dynamic);
+            let plan = create_distributed_plan(window()?, &ctx.state()).await?;
+            let batches =
+                tokio::time::timeout(Duration::from_secs(20), collect(plan, ctx.task_ctx()))
+                    .await
+                    .expect("distributed query deadlocked")?;
+            assert_eq!(rows(&batches)?, expected, "dynamic={dynamic}");
+        }
+        Ok(())
+    }
+
+    /// A one-partition generator that the planner scales to two tasks of `rows` rows each.
+    fn generator(tag: &str, rows: u64) -> Arc<dyn ExecutionPlan> {
+        let ops = vec![vec![WorkUnitOp::Rows(rows)]; 2];
+        Arc::new(RowGeneratorExec::new(
+            WorkUnitFeed::new(RowGeneratorFeedProvider::new(2, ops)),
+            tag.into(),
+            1,
+            None,
+            2 * rows as usize,
+        ))
+    }
+
+    /// `ROW_NUMBER() OVER (PARTITION BY request ORDER BY letter DESC)` over a cross join whose
+    /// build side derives `request` through a metadata cast. DataFusion trusts that constant
+    /// only within each partition, so its native sort omits `request`.
+    fn window() -> Result<Arc<dyn ExecutionPlan>> {
+        let letter = Arc::new(Column::new("letter", 3)) as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::clone(&letter),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some("a".into())))),
+        ));
+        let build = Arc::new(FilterExec::try_new(predicate, generator("build", 1))?);
+        let field = Arc::new(
+            Field::new("request", DataType::Utf8, false)
+                .with_metadata([("logical.contract".to_string(), "request".to_string())].into()),
+        );
+        let request = Arc::new(CastExpr::new_with_target_field(letter, field, None));
+        let build = Arc::new(ProjectionExec::try_new(
+            vec![(request as Arc<dyn PhysicalExpr>, "request".to_string())],
+            build,
+        )?);
+        let probe = Arc::new(ProjectionExec::try_new(
+            vec![(
+                Arc::new(Column::new("letter", 3)) as Arc<dyn PhysicalExpr>,
+                "letter".to_string(),
+            )],
+            generator("probe", 3),
+        )?);
+        let joined = Arc::new(CrossJoinExec::new(build, probe)) as Arc<dyn ExecutionPlan>;
+        let window = create_window_expr(
+            &WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+            "n".into(),
+            &[],
+            &[Arc::new(Column::new("request", 0)) as Arc<dyn PhysicalExpr>],
+            &[PhysicalSortExpr::new(
+                Arc::new(Column::new("letter", 1)),
+                SortOptions {
+                    descending: true,
+                    nulls_first: true,
+                },
+            )],
+            Arc::new(WindowFrame::new_bounds(
+                WindowFrameUnits::Rows,
+                WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                WindowFrameBound::CurrentRow,
+            )),
+            joined.schema(),
+            false,
+            false,
+            None,
+        )?;
+        let plan = Arc::new(BoundedWindowAggExec::try_new(
+            vec![window],
+            joined,
+            InputOrderMode::Sorted,
+            true,
+        )?) as Arc<dyn ExecutionPlan>;
+        let state = native(1).state();
+        let plan = EnsureRequirements::new().optimize(plan, state.config_options())?;
+        DefaultPhysicalPlanner::default().optimize_physical_plan(plan, &state, |_, _| {})
+    }
+
+    fn rows(batches: &[RecordBatch]) -> Result<Vec<Vec<String>>> {
+        let mut rows = batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows()).map(move |row| {
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            ScalarValue::try_from_array(column, row).map(|value| value.to_string())
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    /// A distributed session over `workers` in-memory workers whose leaves are row generators.
+    fn distributed(partitions: usize, workers: usize, dynamic: bool) -> SessionContext {
+        let channels =
+            InMemoryChannelResolver::from_session_builder(|ctx: WorkerQueryContext| async move {
+                Ok(ctx
+                    .builder
+                    .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+                    .with_distributed_work_unit_feed(|leaf: &RowGeneratorExec| Some(&leaf.feed))
+                    .build())
+            });
+        let mut config = SessionConfig::new().with_target_partitions(partitions);
+        config.set_distributed_option_extension(DistributedConfig {
+            dynamic_task_count: dynamic,
+            max_tasks_per_stage: workers,
+            broadcast_joins: true,
+            ..Default::default()
+        });
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .with_distributed_channel_resolver(channels)
+            .with_distributed_worker_resolver(InMemoryWorkerResolver::new(workers))
+            .with_distributed_user_codec(TestWorkUnitFeedExecCodec)
+            .with_distributed_work_unit_feed(|leaf: &RowGeneratorExec| Some(&leaf.feed))
+            .with_distributed_desired_task_count_handler(row_generator_desired_task_count_handler)
+            .with_distributed_scale_up_leaf_node_handler(row_generator_scale_up_leaf_node_handler)
+            .with_distributed_planner()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udtf("test_work_unit", Arc::new(TestWorkUnitFeedFunction));
+        ctx
+    }
+
+    fn native(partitions: usize) -> SessionContext {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(partitions),
+        );
+        ctx.register_udtf("test_work_unit", Arc::new(TestWorkUnitFeedFunction));
+        ctx
+    }
+
+    /// Asserts `sql` returns the native rows, in the native order when `ordered`, and returns
+    /// the largest task count of any stage the distributed run used.
+    async fn assert_native(
+        ctx: &SessionContext,
+        native: &SessionContext,
+        sql: &str,
+        ordered: bool,
+        dynamic: bool,
+    ) -> Result<usize> {
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let actual = tokio::time::timeout(
+            Duration::from_secs(20),
+            collect(Arc::clone(&plan), ctx.task_ctx()),
+        )
+        .await
+        .expect("distributed query deadlocked")?;
+        let expected = native.sql(sql).await?.collect().await?;
+        let lines = |batches: &[RecordBatch]| -> Result<Vec<String>> {
+            let mut lines = pretty_format_batches(batches)?
+                .to_string()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if !ordered {
+                lines.sort_unstable();
+            }
+            Ok(lines)
+        };
+        assert_eq!(
+            lines(&actual)?,
+            lines(&expected)?,
+            "dynamic={dynamic}; {sql}"
+        );
+        let Some(exec) = plan.downcast_ref::<DistributedExec>() else {
+            return Ok(1);
+        };
+        let mut tasks = 1;
+        exec.plan_for_viz()?.apply(|node| {
+            if let Some(boundary) = node.as_network_boundary() {
+                tasks = tasks.max(boundary.input_stage().task_count());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(tasks)
+    }
+
+    /// Serves one shared plan as a table, so the native and distributed sessions read the
+    /// same generator.
+    #[derive(Debug)]
+    struct Input(Arc<dyn ExecutionPlan>);
+
+    #[async_trait::async_trait]
+    impl TableProvider for Input {
+        fn schema(&self) -> SchemaRef {
+            self.0.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            _: &[Expr],
+            _: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            let Some(indices) = projection else {
+                return Ok(Arc::clone(&self.0));
+            };
+            let schema = self.0.schema();
+            let columns = indices
+                .iter()
+                .map(|&index| {
+                    let name = schema.field(index).name();
+                    (
+                        Arc::new(Column::new(name, index)) as Arc<dyn PhysicalExpr>,
+                        name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(Arc::new(ProjectionExec::try_new(
+                columns,
+                Arc::clone(&self.0),
+            )?))
+        }
+    }
+}

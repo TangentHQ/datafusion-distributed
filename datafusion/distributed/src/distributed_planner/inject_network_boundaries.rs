@@ -14,16 +14,20 @@ use crate::{
 use async_trait::async_trait;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{HashMap, JoinType, Result, internal_err, plan_err};
-use datafusion::physical_expr::Partitioning;
+use datafusion::physical_expr::{Distribution, Partitioning};
+use datafusion::physical_optimizer::utils::add_sort_above_with_distribution;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::joins::{
     CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
 };
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::tree_node::PlanContext;
 use datafusion::physical_plan::{
-    ChildrenPropertiesMode, ExecutionPlan, PlanProperties, ReplaceChildrenOptions,
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    ReplaceChildrenOptions,
 };
 use datafusion::prelude::SessionConfig;
 use std::any::TypeId;
@@ -35,7 +39,9 @@ use uuid::Uuid;
 
 /// Walks an [ExecutionPlan] and injects [NetworkShuffleExec], [NetworkBroadcastExec], and
 /// [NetworkCoalesceExec] nodes wherever a stage boundary is needed. The returned plan has the
-/// same shape as the input except for these inserted boundary nodes.
+/// same shape as the input except for these inserted boundary nodes, plus the exchanges, merges
+/// and sorts that keep every node's required input distribution and ordering true across all the
+/// tasks of its stage (see [Requirements across tasks](#requirements-across-tasks)).
 ///
 /// Per-node task counts are recorded in a side map on the [InjectNetworkBoundaryContext] (keyed by
 /// plan-pointer identity) rather than mutated into the plan itself. Later passes look them up via
@@ -137,12 +143,31 @@ use uuid::Uuid;
 ///         └──────────────────────────┘
 /// ```
 ///
+/// # Requirements across tasks
+///
+/// DataFusion plans partitions, not tasks: it omits an exchange when a single partition already
+/// satisfies a requirement, and sorts may omit keys it knows are constant. A stage that runs in
+/// several tasks adds a second partition dimension, so once a node's children are processed,
+/// and unless its stage is limited to one task, each child must also hold the node's
+/// required distribution across tasks:
+///
+/// - `SinglePartition`: a replicated broadcast build side already does. Anything else is gathered
+///   behind a [NetworkCoalesceExec], merged locally when that exposes several partitions.
+/// - Key partitioning: only a hash exchange keeps keys apart across tasks, so any other child
+///   gets a hash [RepartitionExec] that becomes a [NetworkShuffleExec].
+///
+/// Boundaries advertise only the orderings and constants that survive all their producer tasks.
+/// After rebuilding a node over its processed children, any child whose required ordering no
+/// longer holds is re-sorted.
+///
 /// # Exit condition
 ///
 /// When the bottom-up walk reaches the root, there is no parent that could trigger another
-/// boundary injection, so the head stage is closed by running one final Phase 2 pass over
-/// the whole plan. This guarantees every node (including head-stage nodes that never sat
-/// directly above a boundary) has a task count recorded.
+/// boundary injection. The coordinator executes the head stage as one task, so a head that could
+/// span several tasks is first gathered behind a [NetworkCoalesceExec]. The head stage is then
+/// closed by running one final Phase 2 pass over the whole plan. This guarantees every node
+/// (including head-stage nodes that never sat directly above a boundary) has a task count
+/// recorded.
 pub(crate) async fn inject_network_boundaries(
     plan: Arc<dyn ExecutionPlan>,
     nb_builder: impl NetworkBoundaryBuilder + Send + Sync,
@@ -158,7 +183,15 @@ pub(crate) async fn inject_network_boundaries(
         stage_id: &AtomicUsize::new(1),
     };
 
-    _inject_network_boundaries(plan, None, &ctx).await
+    let plan = _inject_network_boundaries(plan, None, &ctx).await?;
+    // The coordinator executes the head stage as one task, so a head that could span several
+    // tasks first gathers them behind a coalesce boundary.
+    let plan = if ctx.task_count(&plan)?.as_usize() > 1 {
+        gather(plan, &ctx).await?
+    } else {
+        plan
+    };
+    ctx.propagate_task_count_until_network_boundaries(&plan, ctx.task_count(&plan)?)
 }
 
 type ConcurrentHashMap<K, V> = Mutex<HashMap<K, V>>;
@@ -236,8 +269,6 @@ async fn _inject_network_boundaries(
     parent: Option<&Arc<dyn ExecutionPlan>>,
     nb_ctx: &InjectNetworkBoundaryContext<'_>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let broadcast_joins_enabled = nb_ctx.d_cfg.broadcast_joins;
-
     let mut futures = Vec::with_capacity(plan.children().len());
     for child in plan.children() {
         let child = Arc::clone(child);
@@ -247,14 +278,71 @@ async fn _inject_network_boundaries(
             nb_ctx,
         )));
     }
-    let processed_children = futures::future::try_join_all(futures).await?;
+    let mut children = futures::future::try_join_all(futures).await?;
 
+    let max_tasks = nb_ctx.max_tasks()?;
+    let mut task_count = annotate(&plan, &children, nb_ctx).await?;
+    // A stage that may span several tasks must hold each child's required distribution across
+    // all of them, not only across the partitions of one task.
+    if max_tasks > 1
+        && task_count.get_max() != Some(NonZeroUsize::MIN)
+        && distribute(&plan, &mut children, nb_ctx).await?
+    {
+        task_count = annotate(&plan, &children, nb_ctx).await?;
+    }
+    let plan = plan.replace_children(
+        children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )?;
+    let plan = sort_children(plan, nb_ctx)?;
+
+    // Cap the reconciled task count by the configured max-per-stage budget.
+    if let Some(min) = task_count.get_min()
+        && max_tasks < min.get()
+    {
+        return plan_err!(
+            "Cannot assign a required task count of {min}, the max task slots available are {max_tasks}"
+        );
+    }
+    task_count.soft = task_count.soft.min(max_tasks as f64);
+    let plan = nb_ctx.plan_with_task_count(plan, task_count);
+
+    // Upon reaching a hash repartition, we need to introduce a network shuffle right above it.
+    if let Some(r_exec) = plan.downcast_ref::<RepartitionExec>()
+        && matches!(r_exec.partitioning(), Partitioning::Hash(_, _))
+    {
+        boundary(plan, Boundary::Shuffle, nb_ctx).await
+    }
+    // Upon reaching a broadcast, we need to introduce a network broadcast right above it.
+    else if plan.is::<BroadcastExec>() {
+        boundary(plan, Boundary::Broadcast, nb_ctx).await
+    }
+    // If the parent of the current node is either a `CoalescePartitionsExec` or a
+    // `SortPreservingMergeExec`, a network boundary below it is necessary.
+    else if let Some(parent) = parent
+        && (parent.is::<CoalescePartitionsExec>() || parent.is::<SortPreservingMergeExec>())
+    {
+        boundary(plan, Boundary::Coalesce, nb_ctx).await
+    } else {
+        // If this is not a network boundary, then we don't need to do anything else. The head
+        // stage is closed by [inject_network_boundaries].
+        Ok(plan)
+    }
+}
+
+/// Reconciles the task count of the stage `plan` belongs to from its processed `children`.
+async fn annotate(
+    plan: &Arc<dyn ExecutionPlan>,
+    children: &[Arc<dyn ExecutionPlan>],
+    nb_ctx: &InjectNetworkBoundaryContext<'_>,
+) -> Result<TaskCountAnnotation> {
+    let broadcast_joins_enabled = nb_ctx.d_cfg.broadcast_joins;
     let ev = DesiredTaskCountEvent {
-        plan: &plan,
+        plan,
         session_config: nb_ctx.cfg,
     };
 
-    let mut task_count = if plan.children().is_empty() {
+    let task_count = if plan.children().is_empty() {
         // This is a leaf node, maybe a DataSourceExec, or maybe something else custom from the user.
         // If we could not determine how many tasks this leaf node should run on, we need to assume
         // it cannot be distributed and use just 1 task.
@@ -269,7 +357,7 @@ async fn _inject_network_boundaries(
         // the union's minimum task count.
         let mut load: f64 = 0.0;
         let mut min: Option<NonZeroUsize> = None;
-        for child in &processed_children {
+        for child in children {
             let child_count = nb_ctx.task_count(child)?;
             load += match child_count.restriction {
                 TaskCountRestriction::Exact(count) => child_count.soft.min(count.get() as f64),
@@ -305,8 +393,8 @@ async fn _inject_network_boundaries(
         // captures any remaining types that were not rewritten (for instance, cases where both
         // sides have one output partition).
         let mut task_count = TaskCountAnnotation::exact(NonZeroUsize::MIN, 0.0);
-        for processed_child in &processed_children {
-            task_count = task_count.merge(nb_ctx.task_count(processed_child)?)?
+        for child in children {
+            task_count = task_count.merge(nb_ctx.task_count(child)?)?
         }
         task_count
     } else if let Some(node) = plan.downcast_ref::<NestedLoopJoinExec>()
@@ -322,8 +410,8 @@ async fn _inject_network_boundaries(
         // captures any remaining types that were not rewritten (for instance, cases where both
         // sides have one output partition).
         let mut task_count = TaskCountAnnotation::exact(NonZeroUsize::MIN, 0.0);
-        for processed_child in &processed_children {
-            task_count = task_count.merge(nb_ctx.task_count(processed_child)?)?
+        for child in children {
+            task_count = task_count.merge(nb_ctx.task_count(child)?)?
         }
         task_count
     } else if plan.is::<CrossJoinExec>() && !broadcast_joins_enabled {
@@ -331,8 +419,8 @@ async fn _inject_network_boundaries(
         // broadcast (it emits only pair rows), so it is only restricted to a single task when
         // broadcasts are unavailable.
         let mut task_count = TaskCountAnnotation::exact(NonZeroUsize::MIN, 0.0);
-        for processed_child in &processed_children {
-            task_count = task_count.merge(nb_ctx.task_count(processed_child)?)?
+        for child in children {
+            task_count = task_count.merge(nb_ctx.task_count(child)?)?
         }
         task_count
     } else {
@@ -341,106 +429,198 @@ async fn _inject_network_boundaries(
             .transpose()?
             .map(|v| v.task_count)
             .unwrap_or(TaskCountAnnotation::soft(0.0));
-        for processed_child in &processed_children {
-            task_count = task_count.merge(nb_ctx.task_count(processed_child)?)?
+        for child in children {
+            task_count = task_count.merge(nb_ctx.task_count(child)?)?
         }
         task_count
     };
+    Ok(task_count)
+}
 
-    let plan = plan.replace_children(
-        processed_children,
-        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-    )?;
-    // Cap the reconciled task count by the configured max-per-stage budget.
-    let max_tasks = nb_ctx.max_tasks()?;
-    if let Some(min) = task_count.get_min()
-        && max_tasks < min.get()
-    {
-        return plan_err!(
-            "Cannot assign a required task count of {min}, the max task slots available are {max_tasks}"
-        );
+/// Makes each child honour the distribution `plan` requires of it across every task of the
+/// stage. DataFusion only plans partitions: it omits the exchange when one partition already
+/// satisfies a requirement, yet a stage can run that partition in several tasks. Returns whether
+/// any child changed.
+async fn distribute(
+    plan: &Arc<dyn ExecutionPlan>,
+    children: &mut [Arc<dyn ExecutionPlan>],
+    nb_ctx: &InjectNetworkBoundaryContext<'_>,
+) -> Result<bool> {
+    let required = plan.input_distribution_requirements().into_per_child();
+    if required.len() != children.len() {
+        return internal_err!("{} requires a distribution for each child", plan.name());
     }
-    task_count.soft = task_count.soft.min(max_tasks as f64);
+    // A key subset only satisfies a requirement when no sibling must be co-partitioned with it.
+    let subset = children.len() == 1;
+    let mut changed = false;
+    for (child, required) in children.iter_mut().zip(required) {
+        *child = match required {
+            Distribution::UnspecifiedDistribution => continue,
+            Distribution::SinglePartition if replicated(child) => continue,
+            Distribution::SinglePartition => gather(Arc::clone(child), nb_ctx).await?,
+            keyed => {
+                // Only a hash exchange keeps keys apart across tasks. Any other partitioning,
+                // including a single partition, holds within one task.
+                let partitioning = child.output_partitioning();
+                if matches!(partitioning, Partitioning::Hash(_, _))
+                    && partitioning
+                        .satisfaction(&keyed, child.equivalence_properties(), subset)
+                        .is_satisfied()
+                {
+                    continue;
+                }
+                let count = partitioning.partition_count();
+                let exchange =
+                    RepartitionExec::try_new(Arc::clone(child), keyed.create_partitioning(count))?
+                        .with_preserve_order();
+                let exchange =
+                    nb_ctx.plan_with_task_count(Arc::new(exchange), nb_ctx.task_count(child)?);
+                boundary(exchange, Boundary::Shuffle, nb_ctx).await?
+            }
+        };
+        changed = true;
+    }
+    Ok(changed)
+}
 
-    // Upon reaching a hash repartition, we need to introduce a network shuffle right above it.
-    if let Some(r_exec) = plan.downcast_ref::<RepartitionExec>()
-        && matches!(r_exec.partitioning(), Partitioning::Hash(_, _))
-    {
-        let input_stage = LocalStage {
-            query_id: nb_ctx.query_id,
-            num: nb_ctx.fetch_add_stage_id(),
-            plan: nb_ctx.plan_with_task_count(plan, task_count),
-            tasks: task_count.as_usize(),
-            metrics_set: Default::default(),
-        };
-        let result = nb_ctx
-            .nb_builder
-            .build(input_stage, TypeId::of::<NetworkShuffleExec>(), nb_ctx)
-            .await?;
-        let shuffle = Arc::new(NetworkShuffleExec::from_stage(
-            result.input_stage,
-            result.input_properties,
-        ));
-        Ok(nb_ctx.plan_with_task_count(shuffle, result.consumer_task_count))
-    }
-    // Upon reaching a broadcast, we need to introduce a network broadcast right above it.
-    else if let Some(_b_exec) = plan.downcast_ref::<BroadcastExec>() {
-        let input_stage = LocalStage {
-            query_id: nb_ctx.query_id,
-            num: nb_ctx.fetch_add_stage_id(),
-            plan: nb_ctx.plan_with_task_count(plan, task_count),
-            tasks: task_count.as_usize(),
-            metrics_set: Default::default(),
-        };
-        let result = nb_ctx
-            .nb_builder
-            .build(input_stage, TypeId::of::<NetworkBroadcastExec>(), nb_ctx)
-            .await?;
-        let nb = Arc::new(NetworkBroadcastExec::from_stage(
-            result.input_stage,
-            result.input_properties,
-        ));
-        Ok(nb_ctx.plan_with_task_count(nb, result.consumer_task_count))
-    }
-    // If the parent of the current node is either a `CoalescePartitionsExec` or a
-    // `SortPreservingMergeExec`, a network boundary below it is necessary.
-    else if let Some(parent) = parent
-        && (parent.is::<CoalescePartitionsExec>() || parent.is::<SortPreservingMergeExec>())
-    {
-        let input_stage = LocalStage {
-            query_id: nb_ctx.query_id,
-            num: nb_ctx.fetch_add_stage_id(),
-            plan: nb_ctx.plan_with_task_count(plan, task_count),
-            tasks: task_count.as_usize(),
-            metrics_set: Default::default(),
-        };
-        let result = nb_ctx
-            .nb_builder
-            .build(input_stage, TypeId::of::<NetworkCoalesceExec>(), nb_ctx)
-            .await?;
-        if result.consumer_task_count.restriction != TaskCountRestriction::Exact(NonZeroUsize::MIN)
-        {
-            return plan_err!("A NetworkCoalesceExec must return an exact task count of 1");
+/// Whether every task already receives all of `plan`'s rows, as a broadcast build side does.
+fn replicated(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    match plan.downcast_ref::<CoalescePartitionsExec>() {
+        Some(coalesce) => {
+            coalesce.fetch().is_none() && coalesce.input().is::<NetworkBroadcastExec>()
         }
-        // The parent that triggered this branch is a `CoalescePartitionsExec` or
-        // `SortPreservingMergeExec`, both of which fold all partitions into one — so the
-        // stage above this boundary must run in exactly one task.
-        let nb = Arc::new(NetworkCoalesceExec::try_from_stage(
+        None => plan.is::<NetworkBroadcastExec>(),
+    }
+}
+
+/// Collects every task of `plan`'s stage into the single task above a coalesce boundary, then
+/// merges the partitions it exposes as DataFusion's `EnforceDistribution` would.
+async fn gather(
+    plan: Arc<dyn ExecutionPlan>,
+    nb_ctx: &InjectNetworkBoundaryContext<'_>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let input = boundary(plan, Boundary::Coalesce, nb_ctx).await?;
+    if input.output_partitioning().partition_count() <= 1 {
+        return Ok(input);
+    }
+    let count = nb_ctx.task_count(&input)?;
+    let merge: Arc<dyn ExecutionPlan> = match input.output_ordering() {
+        Some(ordering) => Arc::new(SortPreservingMergeExec::new(ordering.clone(), input)),
+        None => Arc::new(CoalescePartitionsExec::new(input)),
+    };
+    Ok(nb_ctx.plan_with_task_count(merge, count))
+}
+
+/// Re-sorts each child whose required ordering no longer holds, as DataFusion's
+/// `EnforceSorting` would. Boundaries below may advertise fewer orderings and constants than the
+/// plan was sorted against, so a sort planned with the old properties is replaced, not stacked.
+fn sort_children(
+    plan: Arc<dyn ExecutionPlan>,
+    nb_ctx: &InjectNetworkBoundaryContext<'_>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let required = plan.required_input_ordering();
+    let distributions = plan.input_distribution_requirements().into_per_child();
+    let mut changed = false;
+    let mut children = Vec::with_capacity(distributions.len());
+    for ((child, ordering), distribution) in
+        plan.children().into_iter().zip(required).zip(distributions)
+    {
+        let Some(ordering) = ordering else {
+            children.push(Arc::clone(child));
+            continue;
+        };
+        let requirement = ordering.into_single();
+        if child
+            .equivalence_properties()
+            .ordering_satisfy_requirement(requirement.clone())?
+        {
+            children.push(Arc::clone(child));
+            continue;
+        }
+        let input = match child.downcast_ref::<SortExec>() {
+            Some(sort)
+                if sort.fetch().is_none()
+                    && (sort.preserve_partitioning()
+                        || sort.input().output_partitioning().partition_count() <= 1) =>
+            {
+                Arc::clone(sort.input())
+            }
+            _ => Arc::clone(child),
+        };
+        let node = PlanContext::new(Arc::clone(&input), (), vec![]);
+        let sorted = add_sort_above_with_distribution(node, requirement, None, &distribution).plan;
+        let count = nb_ctx.task_count(child)?;
+        sorted.apply(|node| {
+            if Arc::ptr_eq(node, &input) {
+                return Ok(TreeNodeRecursion::Jump);
+            }
+            nb_ctx.set_task_count(node, count);
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        children.push(sorted);
+        changed = true;
+    }
+    if !changed {
+        return Ok(plan);
+    }
+    plan.replace_children(
+        children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+}
+
+enum Boundary {
+    Shuffle,
+    Broadcast,
+    Coalesce,
+}
+
+/// Closes the stage topped by the annotated `plan` and places the `kind` network boundary
+/// above it.
+async fn boundary(
+    plan: Arc<dyn ExecutionPlan>,
+    kind: Boundary,
+    nb_ctx: &InjectNetworkBoundaryContext<'_>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let count = nb_ctx.task_count(&plan)?;
+    let stage = LocalStage {
+        query_id: nb_ctx.query_id,
+        num: nb_ctx.fetch_add_stage_id(),
+        plan,
+        tasks: count.as_usize(),
+        metrics_set: Default::default(),
+    };
+    let id = match kind {
+        Boundary::Shuffle => TypeId::of::<NetworkShuffleExec>(),
+        Boundary::Broadcast => TypeId::of::<NetworkBroadcastExec>(),
+        Boundary::Coalesce => TypeId::of::<NetworkCoalesceExec>(),
+    };
+    let result = nb_ctx.nb_builder.build(stage, id, nb_ctx).await?;
+    let node: Arc<dyn ExecutionPlan> = match kind {
+        Boundary::Shuffle => Arc::new(NetworkShuffleExec::from_stage(
             result.input_stage,
             result.input_properties,
-            1,
-        )?);
-        Ok(nb_ctx.plan_with_task_count(nb, result.consumer_task_count))
-    } else if parent.is_none() {
-        // We've just finished walking the head stage's subplan. Run a final propagation so
-        // every node in the head stage (which never crossed a stage boundary on the way up)
-        // gets its task count recorded.
-        nb_ctx.propagate_task_count_until_network_boundaries(&plan, task_count)
-    } else {
-        // If this is not the root node, and it's also not a network boundary, then we don't need
-        // to do anything else.
-        Ok(nb_ctx.plan_with_task_count(plan, task_count))
-    }
+        )),
+        Boundary::Broadcast => Arc::new(NetworkBroadcastExec::from_stage(
+            result.input_stage,
+            result.input_properties,
+        )),
+        Boundary::Coalesce => {
+            if result.consumer_task_count.restriction
+                != TaskCountRestriction::Exact(NonZeroUsize::MIN)
+            {
+                return plan_err!("A NetworkCoalesceExec must return an exact task count of 1");
+            }
+            // Whatever triggered this boundary folds all partitions into one, so the stage
+            // above it must run in exactly one task.
+            Arc::new(NetworkCoalesceExec::try_from_stage(
+                result.input_stage,
+                result.input_properties,
+                1,
+            )?)
+        }
+    };
+    Ok(nb_ctx.plan_with_task_count(node, result.consumer_task_count))
 }
 
 /// Walks `plan` top-down and records the given `task_count` for every node up until the next
@@ -1205,10 +1385,9 @@ mod tests {
         assert_snapshot!(annotated, @r"
         ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
           CrossJoinExec: task_count=TaskCountAnnotation: soft=4.00, exact=2
-            CoalescePartitionsExec: task_count=TaskCountAnnotation: soft=4.00, exact=2
-              NetworkBroadcastExec: task_count=TaskCountAnnotation: soft=4.00, exact=2
-                BroadcastExec: task_count=TaskCountAnnotation: soft=0.00, exact=1
-                  DataSourceExec: task_count=TaskCountAnnotation: soft=0.00, exact=1
+            NetworkBroadcastExec: task_count=TaskCountAnnotation: soft=4.00, exact=2
+              BroadcastExec: task_count=TaskCountAnnotation: soft=0.00, exact=1
+                DataSourceExec: task_count=TaskCountAnnotation: soft=0.00, exact=1
             ChildrenIsolatorUnionExec: task_count=TaskCountAnnotation: soft=4.00, exact=2
               DistributedLeafExec: task_count=TaskCountAnnotation: soft=4.00, exact=2
               DistributedLeafExec: task_count=TaskCountAnnotation: soft=4.00, exact=2
@@ -1294,8 +1473,8 @@ mod tests {
           DataSourceExec: file_groups={1 group: [[/testdata/weather/result-000000.parquet, /testdata/weather/result-000001.parquet, /testdata/weather/result-000002.parquet]]}, projection=[MaxTemp, RainToday], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
         ");
 
-        // With target_partitions=1, there is no CoalescePartitionsExec initially
-        // With broadcast, should create one and insert BroadcastExec below it
+        // With target_partitions=1, there is no CoalescePartitionsExec initially. The broadcast
+        // keeps it that way: its one partition already holds every row in each consumer task.
         let test_plan_builder = TestPlanBuilder::new()
             .target_partitions(1)
             .num_workers(4)
@@ -1306,10 +1485,9 @@ mod tests {
         assert!(annotated.contains("Broadcast"));
         assert_snapshot!(annotated, @r"
         HashJoinExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
-          CoalescePartitionsExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
-            NetworkBroadcastExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
-              BroadcastExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
-                DistributedLeafExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
+          NetworkBroadcastExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
+            BroadcastExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
+              DistributedLeafExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
           DistributedLeafExec: task_count=TaskCountAnnotation: soft=4.00, exact=4
         ");
     }
@@ -1670,9 +1848,17 @@ mod tests {
             nb_builder: &CardinalityBasedNetworkBoundaryBuilder,
         };
 
+        // These plans have no root coalesce, so close the head stage without gathering it to
+        // keep showing the multi-task head the walk annotated.
         let annotated = _inject_network_boundaries(plan, None, &network_boundaries_ctx)
             .await
             .expect("failed to annotate plan");
+        let count = network_boundaries_ctx
+            .task_count(&annotated)
+            .expect("missing head task count");
+        let annotated = network_boundaries_ctx
+            .propagate_task_count_until_network_boundaries(&annotated, count)
+            .expect("failed to close head stage");
         debug_annotated(&annotated, 0, &network_boundaries_ctx)
     }
 

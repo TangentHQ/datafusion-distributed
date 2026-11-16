@@ -159,12 +159,17 @@ impl NetworkShuffleExec {
 
     pub(crate) fn from_stage(input_stage: Stage, input_properties: Arc<PlanProperties>) -> Self {
         let producer_partitioning = input_properties.partitioning.clone();
-        let properties = Arc::new(PlanProperties::new(
-            input_properties.equivalence_properties().clone(),
-            producer_partitioning.clone(),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
+        // A dynamic plan never calls `with_input_stage`, so the first properties must already
+        // describe every producer task.
+        let properties = Self::compute_properties(
+            &Arc::new(PlanProperties::new(
+                input_properties.equivalence_properties().clone(),
+                producer_partitioning.clone(),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+            input_stage.task_count(),
+        );
         Self {
             properties,
             producer_partitioning,
