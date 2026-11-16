@@ -18,6 +18,8 @@ use uuid::Uuid;
 pub(crate) trait ErasedWorkUnitFeed: Send + Sync {
     /// Unique identifier of the feed (same UUID as the concrete `WorkUnitFeed`).
     fn id(&self) -> Uuid;
+    fn demand(&self) -> bool;
+    fn feedback(&self, partition: usize, ctx: Arc<TaskContext>) -> Result<Option<super::Feedback>>;
 
     /// Produces a stream of boxed [`WorkUnit`]s for the given partition.
     ///
@@ -37,6 +39,21 @@ where
 {
     fn id(&self) -> Uuid {
         self.id
+    }
+
+    fn demand(&self) -> bool {
+        self.demand
+    }
+    fn feedback(&self, partition: usize, ctx: Arc<TaskContext>) -> Result<Option<super::Feedback>> {
+        if !self.feedback {
+            return Ok(None);
+        }
+        let provider = self.inner().ok_or_else(|| {
+            datafusion::common::internal_datafusion_err!("Remote feed cannot own feedback")
+        })?;
+        provider.feedback(partition, ctx).map(Some).ok_or_else(|| {
+            datafusion::common::internal_datafusion_err!("Missing work unit completion handler")
+        })
     }
 
     fn feed(

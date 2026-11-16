@@ -9,8 +9,8 @@ use crate::protocol::grpc::{ObservabilityServiceImpl, ObservabilityServiceServer
 use crate::{
     ApplyDynamicFilter, CoordinatorToWorkerMsg, DistributedConfig, ExecuteTaskRequest, LoadInfo,
     MaybeEncoded, ProducedDynamicFilter, ProducerHead, SetPlanRequest, TaskCompletedDynamicFilters,
-    TaskKey, TaskMetrics, WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, Worker,
-    WorkerResolver, WorkerToCoordinatorMsg,
+    TaskKey, TaskMetrics, WorkUnitBatch, WorkUnitDemand, WorkUnitFeedDeclaration, WorkUnitMsg,
+    WorkUnitResponse, Worker, WorkerResolver, WorkerToCoordinatorMsg,
 };
 
 use crate::worker::CoordinatorChannelResult;
@@ -219,6 +219,22 @@ fn decode_coordinator_to_worker_msg(
             pb::coordinator_to_worker_msg::Inner::WorkUnitBatch(batch) => {
                 CoordinatorToWorkerMsg::WorkUnitBatch(decode_work_unit_batch(batch)?)
             }
+            pb::coordinator_to_worker_msg::Inner::WorkUnitResponse(response) => {
+                let demand = response
+                    .demand
+                    .ok_or_else(missing("work_unit_response.demand"))?;
+                CoordinatorToWorkerMsg::WorkUnitResponse(WorkUnitResponse {
+                    demand: WorkUnitDemand {
+                        id: deserialize_uuid(&demand.id)
+                            .map_err(datafusion_error_to_tonic_status)?,
+                        partition: usize::try_from(demand.partition)
+                            .map_err(|_| Status::invalid_argument("Demand partition overflow"))?,
+                        sequence: demand.sequence,
+                        feedback: demand.feedback.map(bytes::Bytes::from),
+                    },
+                    unit: response.unit.map(decode_work_unit).transpose()?,
+                })
+            }
             pb::coordinator_to_worker_msg::Inner::WorkUnitEos(_) => {
                 CoordinatorToWorkerMsg::WorkUnitEos
             }
@@ -290,6 +306,11 @@ fn encode_worker_to_coordinator_msg(
 ) -> Result<pb::WorkerToCoordinatorMsg, Status> {
     Ok(pb::WorkerToCoordinatorMsg {
         inner: Some(match msg {
+            WorkerToCoordinatorMsg::WorkUnitDemand(demand) => {
+                pb::worker_to_coordinator_msg::Inner::WorkUnitDemand(
+                    super::worker_client::encode_work_unit_demand(demand),
+                )
+            }
             WorkerToCoordinatorMsg::TaskMetrics(task_metrics) => {
                 pb::worker_to_coordinator_msg::Inner::TaskMetrics(encode_task_metrics(
                     task_metrics,
@@ -409,6 +430,7 @@ fn decode_work_unit_feed_declaration(
     Ok(WorkUnitFeedDeclaration {
         id: deserialize_uuid(&declaration.id).map_err(datafusion_error_to_tonic_status)?,
         partitions: declaration.partitions as usize,
+        demand: declaration.demand,
     })
 }
 

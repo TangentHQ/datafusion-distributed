@@ -2,7 +2,7 @@ use super::TASK_KEY_QUERY_ID_HEADER;
 use super::channel_resolver::BoxCloneSyncChannel;
 use super::errors::{map_flight_to_datafusion_error, map_status_to_datafusion_error};
 use super::generated::worker as pb;
-use crate::common::{RetryOutcome, on_drop_stream, serialize_uuid};
+use crate::common::{RetryOutcome, deserialize_uuid, on_drop_stream, serialize_uuid};
 use crate::grpc::errors::tonic_status_to_datafusion_error;
 use crate::grpc::generated::worker::FlightAppMetadata;
 use crate::metrics::metrics_set_proto_to_df;
@@ -12,7 +12,8 @@ use crate::{
     GetWorkerInfoResponse, LatencyMetricExt, LoadInfo, MaxLatencyMetric, MaybeEncoded,
     MinLatencyMetric, P50LatencyMetric, P95LatencyMetric, ProducedDynamicFilter, ProducerHead,
     SetPlanRequest, TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics,
-    WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
+    WorkUnitBatch, WorkUnitDemand, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel,
+    WorkerToCoordinatorMsg,
 };
 use arrow_flight::FlightData;
 use arrow_flight::decode::FlightRecordBatchStream;
@@ -21,7 +22,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::instant::Instant;
 use datafusion::common::runtime::SpawnedTask;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, exec_datafusion_err};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr_common::metrics::{Count, Label, MetricBuilder, MetricValue, Time};
@@ -511,6 +512,12 @@ fn encode_coordinator_to_worker_msg(
             CoordinatorToWorkerMsg::WorkUnitBatch(batch) => {
                 pb::coordinator_to_worker_msg::Inner::WorkUnitBatch(encode_work_unit_batch(batch))
             }
+            CoordinatorToWorkerMsg::WorkUnitResponse(response) => {
+                pb::coordinator_to_worker_msg::Inner::WorkUnitResponse(pb::WorkUnitResponse {
+                    demand: Some(encode_work_unit_demand(response.demand)),
+                    unit: response.unit.map(encode_work_unit),
+                })
+            }
             CoordinatorToWorkerMsg::WorkUnitEos => {
                 pb::coordinator_to_worker_msg::Inner::WorkUnitEos(true)
             }
@@ -546,6 +553,15 @@ fn encode_set_plan_request(
     })
 }
 
+pub(super) fn encode_work_unit_demand(demand: WorkUnitDemand) -> pb::WorkUnitDemand {
+    pb::WorkUnitDemand {
+        id: serialize_uuid(&demand.id),
+        partition: demand.partition as u64,
+        sequence: demand.sequence,
+        feedback: demand.feedback.map(|body| body.to_vec()),
+    }
+}
+
 fn encode_work_unit_batch(batch: WorkUnitBatch) -> pb::WorkUnitBatch {
     pb::WorkUnitBatch {
         batch: batch.batch.into_iter().map(encode_work_unit).collect(),
@@ -573,6 +589,7 @@ fn encode_work_unit_feed_declaration(
     pb::set_plan_request::WorkUnitFeedDeclaration {
         id: serialize_uuid(&declaration.id),
         partitions: declaration.partitions as u64,
+        demand: declaration.demand,
     }
 }
 
@@ -592,6 +609,15 @@ fn decode_worker_to_coordinator_msg(
             .inner
             .ok_or_else(|| missing("WorkerToCoordinatorMsg.inner"))?
         {
+            pb::worker_to_coordinator_msg::Inner::WorkUnitDemand(demand) => {
+                WorkerToCoordinatorMsg::WorkUnitDemand(WorkUnitDemand {
+                    id: deserialize_uuid(&demand.id)?,
+                    partition: usize::try_from(demand.partition)
+                        .map_err(|_| exec_datafusion_err!("Demand partition overflow"))?,
+                    sequence: demand.sequence,
+                    feedback: demand.feedback.map(bytes::Bytes::from),
+                })
+            }
             pb::worker_to_coordinator_msg::Inner::TaskMetrics(task_metrics) => {
                 WorkerToCoordinatorMsg::TaskMetrics(decode_task_metrics(task_metrics)?)
             }
