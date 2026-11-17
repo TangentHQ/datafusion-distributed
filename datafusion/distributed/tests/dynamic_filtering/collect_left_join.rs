@@ -34,12 +34,11 @@ mod tests {
         │     CoalescePartitionsExec
         │       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
         │         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, MinTemp@0)], projection=[]
-        │           CoalescePartitionsExec
-        │             BroadcastExec: input_partitions=1, consumer_tasks=1, output_partitions=1
-        │               ProjectionExec: expr=[avg(MinTemp)@0 as key]
-        │                 AggregateExec: mode=Final, gby=[], aggr=[avg(MinTemp)]
-        │                   CoalescePartitionsExec
-        │                     [Stage 1] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
+        │           BroadcastExec: input_partitions=1, consumer_tasks=1, output_partitions=1
+        │             ProjectionExec: expr=[avg(MinTemp)@0 as key]
+        │               AggregateExec: mode=Final, gby=[], aggr=[avg(MinTemp)]
+        │                 CoalescePartitionsExec
+        │                   [Stage 1] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
         │           DistributedLeafExec:
         │             t0: DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet:<int>..<int>], [/testdata/weather/result-000000.parquet:<int>..<int>, /testdata/weather/result-000001.parquet:<int>..<int>, /testdata/weather/result-000002.parquet:<int>..<int>], [/testdata/weather/result-000002.parquet:<int>..<int>]]}, projection=[MinTemp], file_type=parquet, predicate=DynamicFilter [ expression_id_0_hash_0 ], dynamic_rg_pruning=eligible
         └──────────────────────────────────────────────────

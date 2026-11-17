@@ -66,11 +66,9 @@ mod tests {
             │     CoalescePartitionsExec
             │       [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
             │     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(n_nationkey@0, s_nationkey@4)], projection=[p_partkey@3, p_mfgr@4, s_name@5, s_address@6, s_phone@8, s_acctbal@9, s_comment@10, ps_supplycost@11, n_name@1, n_regionkey@2]
-            │       CoalescePartitionsExec
-            │         [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │       [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, ps_suppkey@2)], projection=[p_partkey@7, p_mfgr@8, s_name@1, s_address@2, s_nationkey@3, s_phone@4, s_acctbal@5, s_comment@6, ps_supplycost@10]
-            │         CoalescePartitionsExec
-            │           [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │         [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, ps_partkey@0)], projection=[p_partkey@0, p_mfgr@1, ps_suppkey@3, ps_supplycost@4]
             │           CoalescePartitionsExec
             │             [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
@@ -129,11 +127,9 @@ mod tests {
               │       CoalescePartitionsExec
               │         [Stage 6] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
               │       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(n_nationkey@0, s_nationkey@2)], projection=[ps_partkey@2, ps_supplycost@3, n_regionkey@1]
-              │         CoalescePartitionsExec
-              │           [Stage 7] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+              │         [Stage 7] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
               │         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, ps_suppkey@1)], projection=[ps_partkey@2, ps_supplycost@4, s_nationkey@1]
-              │           CoalescePartitionsExec
-              │             [Stage 8] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+              │           [Stage 8] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
               │           DistributedLeafExec:
               │             t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/1.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/2.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/3.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/4.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/5.parquet:<int>..<int>]]}, projection=[ps_partkey, ps_suppkey, ps_supplycost], output_ordering=[ps_partkey@0 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
               │             t1: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/1.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/3.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/5.parquet:<int>..<int>]]}, projection=[ps_partkey, ps_suppkey, ps_supplycost], output_ordering=[ps_partkey@0 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
@@ -287,11 +283,9 @@ mod tests {
             │       CoalescePartitionsExec
             │         [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
             │       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(n_nationkey@0, s_nationkey@2)], projection=[l_extendedprice@3, l_discount@4, n_name@1, n_regionkey@2]
-            │         CoalescePartitionsExec
-            │           [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │         [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, l_suppkey@1), (s_nationkey@1, c_nationkey@0)], projection=[l_extendedprice@4, l_discount@5, s_nationkey@1]
-            │           CoalescePartitionsExec
-            │             [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │           [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │           HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderkey@1, l_orderkey@0)], projection=[c_nationkey@0, l_suppkey@3, l_extendedprice@4, l_discount@5]
             │             CoalescePartitionsExec
             │               [Stage 5] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
@@ -330,8 +324,7 @@ mod tests {
               ┌───── Stage 5 ── tasks=4, partitions=48
               │ BroadcastExec: input_partitions=3, consumer_tasks=4, output_partitions=12
               │   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(c_custkey@0, o_custkey@1)], projection=[c_nationkey@1, o_orderkey@2]
-              │     CoalescePartitionsExec
-              │       [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+              │     [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
               │     FilterExec: o_orderdate@2 >= 1994-01-01 AND o_orderdate@2 < 1995-01-01, projection=[o_orderkey@0, o_custkey@1]
               │       DistributedLeafExec:
               │         t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/1.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/2.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/3.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/5.parquet:<int>..<int>]]}, projection=[o_orderkey, o_custkey, o_orderdate], output_ordering=[o_orderkey@0 ASC NULLS LAST], file_type=parquet, predicate=o_orderdate@4 >= 1994-01-01 AND o_orderdate@4 < 1995-01-01 AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=o_orderdate_null_count@1 != row_count@2 AND o_orderdate_max@0 >= 1994-01-01 AND o_orderdate_null_count@1 != row_count@2 AND o_orderdate_min@3 < 1995-01-01, required_guarantees=[]
@@ -399,14 +392,12 @@ mod tests {
             │           CoalescePartitionsExec
             │             [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
             │           HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(c_custkey@0, o_custkey@4)], projection=[s_nationkey@2, l_extendedprice@3, l_discount@4, l_shipdate@5, c_nationkey@1]
-            │             CoalescePartitionsExec
-            │               [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │             [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │             HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderkey@0, l_orderkey@1)], projection=[s_nationkey@2, l_extendedprice@4, l_discount@5, l_shipdate@6, o_custkey@1]
             │               CoalescePartitionsExec
             │                 [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
             │               HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, l_suppkey@1)], projection=[s_nationkey@1, l_orderkey@2, l_extendedprice@4, l_discount@5, l_shipdate@6]
-            │                 CoalescePartitionsExec
-            │                   [Stage 5] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │                 [Stage 5] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │                 FilterExec: l_shipdate@4 >= 1995-01-01 AND l_shipdate@4 <= 1996-12-31
             │                   DistributedLeafExec:
             │                     t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/1.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/10.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/14.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/15.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/16.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/4.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/5.parquet:<int>..<int>]]}, projection=[l_orderkey, l_suppkey, l_extendedprice, l_discount, l_shipdate], file_type=parquet, predicate=l_shipdate@10 >= 1995-01-01 AND l_shipdate@10 <= 1996-12-31 AND DynamicFilter [ empty ] AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=l_shipdate_null_count@1 != row_count@2 AND l_shipdate_max@0 >= 1995-01-01 AND l_shipdate_null_count@1 != row_count@2 AND l_shipdate_min@3 <= 1996-12-31, required_guarantees=[]
@@ -484,20 +475,16 @@ mod tests {
             │         CoalescePartitionsExec
             │           [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
             │         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(n_nationkey@0, s_nationkey@2)], projection=[l_extendedprice@2, l_discount@3, o_orderdate@5, n_regionkey@6, n_name@1]
-            │           CoalescePartitionsExec
-            │             [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │           [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │           HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(n_nationkey@0, c_nationkey@4)], projection=[l_extendedprice@2, l_discount@3, s_nationkey@4, o_orderdate@5, n_regionkey@1]
-            │             CoalescePartitionsExec
-            │               [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │             [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │             HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(c_custkey@0, o_custkey@3)], projection=[l_extendedprice@2, l_discount@3, s_nationkey@4, o_orderdate@6, c_nationkey@1]
-            │               CoalescePartitionsExec
-            │                 [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │               [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │               HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderkey@0, l_orderkey@0)], projection=[l_extendedprice@4, l_discount@5, s_nationkey@6, o_custkey@1, o_orderdate@2]
             │                 CoalescePartitionsExec
             │                   [Stage 5] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
             │                 HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, l_suppkey@1)], projection=[l_orderkey@2, l_extendedprice@4, l_discount@5, s_nationkey@1]
-            │                   CoalescePartitionsExec
-            │                     [Stage 6] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │                   [Stage 6] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │                   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@1)], projection=[l_orderkey@1, l_suppkey@3, l_extendedprice@4, l_discount@5]
             │                     CoalescePartitionsExec
             │                       [Stage 7] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
@@ -591,8 +578,7 @@ mod tests {
             │   AggregateExec: mode=Partial, gby=[nation@0 as nation, o_year@1 as o_year], aggr=[sum(profit.amount)]
             │     ProjectionExec: expr=[n_name@0 as nation, date_part(YEAR, o_orderdate@1) as o_year, l_extendedprice@2 * (1 - l_discount@3) - ps_supplycost@4 * l_quantity@5 as amount]
             │       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(n_nationkey@0, s_nationkey@3)], projection=[n_name@1, o_orderdate@7, l_extendedprice@3, l_discount@4, ps_supplycost@6, l_quantity@2]
-            │         CoalescePartitionsExec
-            │           [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │         [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderkey@0, l_orderkey@0)], projection=[l_quantity@3, l_extendedprice@4, l_discount@5, s_nationkey@6, ps_supplycost@7, o_orderdate@1]
             │           CoalescePartitionsExec
             │             [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
@@ -600,8 +586,7 @@ mod tests {
             │             CoalescePartitionsExec
             │               [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
             │             HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, l_suppkey@2)], projection=[l_orderkey@2, l_partkey@3, l_suppkey@4, l_quantity@5, l_extendedprice@6, l_discount@7, s_nationkey@1]
-            │               CoalescePartitionsExec
-            │                 [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │               [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │               HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@1)], projection=[l_orderkey@1, l_partkey@2, l_suppkey@3, l_quantity@4, l_extendedprice@5, l_discount@6]
             │                 CoalescePartitionsExec
             │                   [Stage 5] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
@@ -675,11 +660,9 @@ mod tests {
             │ RepartitionExec: partitioning=Hash([c_custkey@0, c_name@1, c_acctbal@2, c_phone@3, n_name@4, c_address@5, c_comment@6], 9), input_partitions=3
             │   AggregateExec: mode=Partial, gby=[c_custkey@0 as c_custkey, c_name@1 as c_name, c_acctbal@4 as c_acctbal, c_phone@3 as c_phone, n_name@8 as n_name, c_address@2 as c_address, c_comment@5 as c_comment], aggr=[sum(lineitem.l_extendedprice * 1 - lineitem.l_discount) as sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)]
             │     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(n_nationkey@0, c_nationkey@3)], projection=[c_custkey@2, c_name@3, c_address@4, c_phone@6, c_acctbal@7, c_comment@8, l_extendedprice@9, l_discount@10, n_name@1]
-            │       CoalescePartitionsExec
-            │         [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │       [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderkey@7, l_orderkey@0)], projection=[c_custkey@0, c_name@1, c_address@2, c_nationkey@3, c_phone@4, c_acctbal@5, c_comment@6, l_extendedprice@9, l_discount@10]
-            │         CoalescePartitionsExec
-            │           [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │         [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │         FilterExec: l_returnflag@3 = R, projection=[l_orderkey@0, l_extendedprice@1, l_discount@2]
             │           DistributedLeafExec:
             │             t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/1.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/10.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/14.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/15.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/16.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/4.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/5.parquet:<int>..<int>]]}, projection=[l_orderkey, l_extendedprice, l_discount, l_returnflag], file_type=parquet, predicate=l_returnflag@8 = R AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=l_returnflag_null_count@2 != row_count@3 AND l_returnflag_min@0 <= R AND R <= l_returnflag_max@1, required_guarantees=[l_returnflag in (R)]
@@ -731,8 +714,7 @@ mod tests {
           │ SortExec: expr=[value@1 DESC], preserve_partitioning=[true]
           │   ProjectionExec: expr=[ps_partkey@1 as ps_partkey, sum(partsupp.ps_supplycost * partsupp.ps_availqty)@2 as value]
           │     NestedLoopJoinExec: join_type=Inner, filter=join_proj_push_down_1@1 > sum(partsupp.ps_supplycost * partsupp.ps_availqty) * Float64(0.0001)@0, projection=[sum(partsupp.ps_supplycost * partsupp.ps_availqty) * Float64(0.0001)@0, ps_partkey@1, sum(partsupp.ps_supplycost * partsupp.ps_availqty)@2]
-          │       CoalescePartitionsExec
-          │         [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=3, input_tasks=1
+          │       [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=3, input_tasks=1
           │       ProjectionExec: expr=[ps_partkey@0 as ps_partkey, sum(partsupp.ps_supplycost * partsupp.ps_availqty)@1 as sum(partsupp.ps_supplycost * partsupp.ps_availqty), CAST(sum(partsupp.ps_supplycost * partsupp.ps_availqty)@1 AS Decimal128(38, 15)) as join_proj_push_down_1]
           │         AggregateExec: mode=FinalPartitioned, gby=[ps_partkey@0 as ps_partkey], aggr=[sum(partsupp.ps_supplycost * partsupp.ps_availqty)], group_clustering_mode=Full
           │           [Stage 7] => NetworkShuffleExec: output_partitions=3, input_tasks=4, sort_exprs=[ps_partkey@0 ASC NULLS LAST]
@@ -750,8 +732,7 @@ mod tests {
               │     CoalescePartitionsExec
               │       [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
               │     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, ps_suppkey@0)], projection=[ps_availqty@3, ps_supplycost@4, s_nationkey@1]
-              │       CoalescePartitionsExec
-              │         [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+              │       [Stage 2] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
               │       DistributedLeafExec:
               │         t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/1.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/2.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/3.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/4.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/5.parquet:<int>..<int>]]}, projection=[ps_suppkey, ps_availqty, ps_supplycost], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
               │         t1: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/1.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/3.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/5.parquet:<int>..<int>]]}, projection=[ps_suppkey, ps_availqty, ps_supplycost], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
@@ -783,8 +764,7 @@ mod tests {
             │       CoalescePartitionsExec
             │         [Stage 5] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
             │       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, ps_suppkey@1)], projection=[ps_partkey@2, ps_availqty@4, ps_supplycost@5, s_nationkey@1]
-            │         CoalescePartitionsExec
-            │           [Stage 6] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+            │         [Stage 6] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
             │         DistributedLeafExec:
             │           t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/1.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/2.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/3.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/4.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/5.parquet:<int>..<int>]]}, projection=[ps_partkey, ps_suppkey, ps_availqty, ps_supplycost], output_ordering=[ps_partkey@0 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
             │           t1: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/1.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/3.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/partsupp/5.parquet:<int>..<int>]]}, projection=[ps_partkey, ps_suppkey, ps_availqty, ps_supplycost], output_ordering=[ps_partkey@0 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
@@ -947,13 +927,11 @@ mod tests {
         └──────────────────────────────────────────────────
           ┌───── Stage 6 ── tasks=4, partitions=3
           │ HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(max(revenue0.total_revenue)@0, total_revenue@4)], projection=[s_suppkey@1, s_name@2, s_address@3, s_phone@4, total_revenue@5]
-          │   CoalescePartitionsExec
-          │     [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=1
+          │   [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=1
           │   SortExec: expr=[s_suppkey@0 ASC NULLS LAST], preserve_partitioning=[true]
           │     FilterExec: DynamicFilter [ empty ]
           │       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, supplier_no@0)], projection=[s_suppkey@0, s_name@1, s_address@2, s_phone@3, total_revenue@5]
-          │         CoalescePartitionsExec
-          │           [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+          │         [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
           │         ProjectionExec: expr=[l_suppkey@0 as supplier_no, sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)@1 as total_revenue]
           │           AggregateExec: mode=FinalPartitioned, gby=[l_suppkey@0 as l_suppkey], aggr=[sum(lineitem.l_extendedprice * 1 - lineitem.l_discount) as sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)]
           │             [Stage 5] => NetworkShuffleExec: output_partitions=3, input_tasks=4
@@ -1151,8 +1129,7 @@ mod tests {
                 ┌───── Stage 2 ── tasks=4, partitions=48
                 │ BroadcastExec: input_partitions=3, consumer_tasks=4, output_partitions=12
                 │   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, c_name@1, o_orderkey@2, o_totalprice@4, o_orderdate@5]
-                │     CoalescePartitionsExec
-                │       [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+                │     [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
                 │     DistributedLeafExec:
                 │       t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/1.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/2.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/3.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/5.parquet:<int>..<int>]]}, projection=[o_orderkey, o_custkey, o_totalprice, o_orderdate], output_ordering=[o_orderkey@0 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
                 │       t1: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/1.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/2.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/3.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/4.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/5.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/orders/6.parquet:<int>..<int>]]}, projection=[o_orderkey, o_custkey, o_totalprice, o_orderdate], output_ordering=[o_orderkey@0 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
@@ -1346,8 +1323,7 @@ mod tests {
               │       CoalescePartitionsExec
               │         [Stage 3] => NetworkBroadcastExec: partitions_per_consumer=3, stage_partitions=12, input_tasks=4
               │       HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, l_suppkey@1)], projection=[s_name@1, s_nationkey@2, l_orderkey@3, l_suppkey@4]
-              │         CoalescePartitionsExec
-              │           [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
+              │         [Stage 4] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=4, input_tasks=4
               │         FilterExec: l_receiptdate@3 > l_commitdate@2, projection=[l_orderkey@0, l_suppkey@1]
               │           DistributedLeafExec:
               │             t0: DataSourceExec: file_groups={3 groups: [[/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/1.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/10.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/14.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/15.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/16.parquet:<int>..<int>], [/testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/4.parquet:<int>..<int>, /testdata/tpch_parquet/scale_factor=0.02/max_file_size=400000/dictionary=pages/sorted=true/lineitem/5.parquet:<int>..<int>]]}, projection=[l_orderkey, l_suppkey, l_commitdate, l_receiptdate], file_type=parquet, predicate=l_receiptdate@12 > l_commitdate@11 AND DynamicFilter [ empty ] AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
@@ -1408,11 +1384,10 @@ mod tests {
         │             ProjectionExec: expr=[substr(c_phone@0, 1, 2) as cntrycode, c_acctbal@1 as c_acctbal]
         │               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1
         │                 NestedLoopJoinExec: join_type=Inner, filter=join_proj_push_down_1@1 > avg(customer.c_acctbal)@0, projection=[c_phone@0, c_acctbal@1, avg(customer.c_acctbal)@3]
-        │                   CoalescePartitionsExec
-        │                     BroadcastExec: input_partitions=1, consumer_tasks=1, output_partitions=1
-        │                       ProjectionExec: expr=[c_phone@0 as c_phone, c_acctbal@1 as c_acctbal, CAST(c_acctbal@1 AS Decimal128(19, 6)) as join_proj_push_down_1]
-        │                         CoalescePartitionsExec
-        │                           [Stage 3] => NetworkCoalesceExec: output_partitions=12, input_tasks=4
+        │                   BroadcastExec: input_partitions=1, consumer_tasks=1, output_partitions=1
+        │                     ProjectionExec: expr=[c_phone@0 as c_phone, c_acctbal@1 as c_acctbal, CAST(c_acctbal@1 AS Decimal128(19, 6)) as join_proj_push_down_1]
+        │                       CoalescePartitionsExec
+        │                         [Stage 3] => NetworkCoalesceExec: output_partitions=12, input_tasks=4
         │                   AggregateExec: mode=Final, gby=[], aggr=[avg(customer.c_acctbal)]
         │                     CoalescePartitionsExec
         │                       [Stage 4] => NetworkCoalesceExec: output_partitions=12, input_tasks=4
