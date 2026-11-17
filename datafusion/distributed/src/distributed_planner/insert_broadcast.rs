@@ -542,7 +542,7 @@ mod tests {
         let filtered = Arc::new(FilterExec::try_new(predicate, source)?);
         let field = Arc::new(
             Field::new("request", DataType::Utf8, false)
-                .with_metadata([("logical.contract".to_string(), "request".to_string())].into()),
+                .with_metadata([("logical.contract".to_string(), "request".to_string())]),
         );
         Ok(Arc::new(ProjectionExec::try_new(
             vec![

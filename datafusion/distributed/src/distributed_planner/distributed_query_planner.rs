@@ -1276,7 +1276,7 @@ mod task_requirement_tests {
         let build = Arc::new(FilterExec::try_new(predicate, generator("build", 1))?);
         let field = Arc::new(
             Field::new("request", DataType::Utf8, false)
-                .with_metadata([("logical.contract".to_string(), "request".to_string())].into()),
+                .with_metadata([("logical.contract".to_string(), "request".to_string())]),
         );
         let request = Arc::new(CastExpr::new_with_target_field(letter, field, None));
         let build = Arc::new(ProjectionExec::try_new(
@@ -1448,7 +1448,7 @@ mod task_requirement_tests {
         async fn scan(
             &self,
             _: &dyn Session,
-            projection: Option<&Vec<usize>>,
+            projection: Option<&[usize]>,
             _: &[Expr],
             _: Option<usize>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
