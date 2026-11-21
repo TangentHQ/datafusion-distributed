@@ -108,10 +108,14 @@ impl ProducerHead {
                 preserve_order,
             } => {
                 let repartition = RepartitionExec::try_new(input, partitioning.try_decoded()?)?;
+                // Each output of an unordered head has its own consumer task reading it to the
+                // end, so when memory runs out the producer waits for its consumers to drain
+                // the head instead of spilling what a slower one leaves behind. An ordered head
+                // keeps spilling: its consumers sort-merge across producer tasks.
                 Arc::new(if preserve_order {
                     repartition.with_preserve_order()
                 } else {
-                    repartition
+                    repartition.with_memory_wait()
                 })
             }
         };
